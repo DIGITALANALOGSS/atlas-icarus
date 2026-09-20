@@ -1,0 +1,32 @@
+# Local secrets and configuration
+.env
+.env.*
+!.env.example
+secrets/
+*.key
+*.pem
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Node.js
+node_modules/
+dist/
+build/
+
+# Local data and generated artifacts
+data/
+models/
+exports/
+backups/
+research/
+*.sqlite
+*.db
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
