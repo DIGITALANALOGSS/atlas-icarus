@@ -374,6 +374,74 @@ async def create_evidence_record(intake_id: UUID, record: EvidenceRecordCreate) 
     }
 
 
+
+@app.get("/intake-items/{intake_id}/evidence-records")
+async def list_intake_evidence_records(
+    intake_id: UUID,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    try:
+        async with app.state.pool.acquire() as connection:
+            intake = await connection.fetchrow(
+                """
+                SELECT intake_id
+                FROM intake_items
+                WHERE intake_id = $1
+                """,
+                intake_id,
+            )
+            if intake is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="intake item not found",
+                )
+
+            rows = await connection.fetch(
+                """
+                SELECT
+                  evidence_id, intake_id, sha256, storage_reference,
+                  media_type, filename, description, metadata,
+                  correlation_id, created_at
+                FROM evidence_records
+                WHERE intake_id = $1
+                ORDER BY created_at DESC, evidence_id DESC
+                LIMIT $2 OFFSET $3
+                """,
+                intake_id,
+                limit,
+                offset,
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database query failed",
+        ) from exc
+
+    return {
+        "intake_id": str(intake_id),
+        "limit": limit,
+        "offset": offset,
+        "items": [
+            {
+                "evidence_id": str(row["evidence_id"]),
+                "intake_id": str(row["intake_id"]),
+                "sha256": row["sha256"],
+                "storage_reference": row["storage_reference"],
+                "media_type": row["media_type"],
+                "filename": row["filename"],
+                "description": row["description"],
+                "metadata": json.loads(row["metadata"]),
+                "correlation_id": str(row["correlation_id"]),
+                "created_at": row["created_at"].isoformat().replace("+00:00", "Z"),
+            }
+            for row in rows
+        ],
+    }
+
+
 @app.get("/intake-items/{intake_id}/events")
 async def list_intake_events(intake_id: UUID) -> dict:
     try:
