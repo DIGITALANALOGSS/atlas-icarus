@@ -30,5 +30,12 @@ services:
       postgres:
         condition: service_healthy
 
+  atlas-control-tests:
+    build:
+      context: ./services/atlas-control
+      target: test
+    profiles:
+      - test
+
 volumes:
   postgres_data:
