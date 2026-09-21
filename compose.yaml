@@ -20,6 +20,7 @@ services:
   atlas-control:
     build:
       context: ./services/atlas-control
+      target: runtime
     container_name: atlas-control
     restart: unless-stopped
     environment:
