@@ -261,6 +261,47 @@ async def create_intake_item(item: IntakeItemCreate) -> dict:
     }
 
 
+@app.get("/evidence-records/{evidence_id}")
+async def get_evidence_record(evidence_id: UUID) -> dict:
+    try:
+        async with app.state.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT
+                  evidence_id, intake_id, sha256, storage_reference,
+                  media_type, filename, description, metadata,
+                  correlation_id, created_at
+                FROM evidence_records
+                WHERE evidence_id = $1
+                """,
+                evidence_id,
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database query failed",
+        ) from exc
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="evidence record not found",
+        )
+
+    return {
+        "evidence_id": str(row["evidence_id"]),
+        "intake_id": str(row["intake_id"]),
+        "sha256": row["sha256"],
+        "storage_reference": row["storage_reference"],
+        "media_type": row["media_type"],
+        "filename": row["filename"],
+        "description": row["description"],
+        "metadata": json.loads(row["metadata"]),
+        "correlation_id": str(row["correlation_id"]),
+        "created_at": row["created_at"].isoformat().replace("+00:00", "Z"),
+    }
+
+
 @app.post("/intake-items/{intake_id}/evidence-records", status_code=status.HTTP_201_CREATED)
 async def create_evidence_record(intake_id: UUID, record: EvidenceRecordCreate) -> dict:
     evidence_id = uuid4()
