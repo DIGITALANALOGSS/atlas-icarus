@@ -229,6 +229,64 @@ async def create_intake_item(item: IntakeItemCreate) -> dict:
     }
 
 
+@app.get("/intake-items/{intake_id}/events")
+async def list_intake_events(intake_id: UUID) -> dict:
+    try:
+        async with app.state.pool.acquire() as connection:
+            intake = await connection.fetchrow(
+                """
+                SELECT intake_id, correlation_id
+                FROM intake_items
+                WHERE intake_id = $1
+                """,
+                intake_id,
+            )
+            if intake is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="intake item not found",
+                )
+
+            rows = await connection.fetch(
+                """
+                SELECT
+                  event_id, event_type, occurred_at, producer,
+                  correlation_id, schema_version, payload
+                FROM events
+                WHERE correlation_id = $1
+                ORDER BY occurred_at ASC, event_id ASC
+                """,
+                intake["correlation_id"],
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database query failed",
+        ) from exc
+
+    events = [
+        {
+            "event_id": str(row["event_id"]),
+            "event_type": row["event_type"],
+            "occurred_at": row["occurred_at"].isoformat().replace("+00:00", "Z"),
+            "producer": row["producer"],
+            "correlation_id": str(row["correlation_id"]),
+            "schema_version": row["schema_version"],
+            "payload": row["payload"],
+        }
+        for row in rows
+    ]
+
+    return {
+        "intake_id": str(intake["intake_id"]),
+        "correlation_id": str(intake["correlation_id"]),
+        "events": events,
+        "count": len(events),
+    }
+
+
 @app.get("/intake-items/{intake_id}")
 async def get_intake_item(intake_id: UUID) -> dict:
     try:
