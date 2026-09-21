@@ -66,6 +66,38 @@ class IntakeItemCreate(BaseModel):
         return value or None
 
 
+class EvidenceRecordCreate(BaseModel):
+    sha256: str
+    storage_reference: str = Field(min_length=1, max_length=2000)
+    media_type: str | None = Field(default=None, max_length=255)
+    filename: str | None = Field(default=None, max_length=1000)
+    description: str | None = Field(default=None, max_length=2000)
+    metadata: dict = Field(default_factory=dict)
+
+    @field_validator("sha256")
+    @classmethod
+    def validate_sha256(cls, value: str) -> str:
+        if not SHA256_PATTERN.fullmatch(value):
+            raise ValueError("must be exactly 64 lowercase hexadecimal characters")
+        return value
+
+    @field_validator("storage_reference")
+    @classmethod
+    def strip_storage_reference(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("media_type", "filename", "description")
+    @classmethod
+    def strip_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
 async def apply_migrations(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as connection:
         await connection.execute(
@@ -226,6 +258,78 @@ async def create_intake_item(item: IntakeItemCreate) -> dict:
         "correlation_id": str(correlation_id),
         "occurred_at": occurred_at.isoformat().replace("+00:00", "Z"),
         "item": payload,
+    }
+
+
+@app.post("/intake-items/{intake_id}/evidence-records", status_code=status.HTTP_201_CREATED)
+async def create_evidence_record(intake_id: UUID, record: EvidenceRecordCreate) -> dict:
+    evidence_id = uuid4()
+    event_id = uuid4()
+    occurred_at = datetime.now(timezone.utc)
+    try:
+        async with app.state.pool.acquire() as connection:
+            async with connection.transaction():
+                intake = await connection.fetchrow("SELECT correlation_id FROM intake_items WHERE intake_id = $1", intake_id)
+                if intake is None:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="intake item not found")
+                correlation_id = intake["correlation_id"]
+                await connection.execute(
+                    """
+                    INSERT INTO evidence_records (
+                      evidence_id, intake_id, sha256, storage_reference,
+                      media_type, filename, description, metadata, correlation_id
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+                    """,
+                    evidence_id, intake_id, record.sha256, record.storage_reference,
+                    record.media_type, record.filename, record.description,
+                    json.dumps(record.metadata), correlation_id,
+                )
+                payload = {
+                    "evidence_id": str(evidence_id),
+                    "intake_id": str(intake_id),
+                    "sha256": record.sha256,
+                    "storage_reference": record.storage_reference,
+                    "media_type": record.media_type,
+                    "filename": record.filename,
+                    "description": record.description,
+                    "metadata": record.metadata,
+                }
+                await connection.execute(
+                    """
+                    INSERT INTO events (
+                      event_id, event_type, occurred_at, producer,
+                      correlation_id, schema_version, payload
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                    """,
+                    event_id,
+                    "research.evidence.recorded",
+                    occurred_at,
+                    SERVICE_NAME,
+                    correlation_id,
+                    "1.0",
+                    json.dumps(payload),
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="database write failed") from exc
+    return {
+        "evidence_id": str(evidence_id),
+        "event_id": str(event_id),
+        "event_type": "research.evidence.recorded",
+        "intake_id": str(intake_id),
+        "correlation_id": str(correlation_id),
+        "occurred_at": occurred_at.isoformat().replace("+00:00", "Z"),
+        "record": {
+            "sha256": record.sha256,
+            "storage_reference": record.storage_reference,
+            "media_type": record.media_type,
+            "filename": record.filename,
+            "description": record.description,
+            "metadata": record.metadata,
+        },
     }
 
 
