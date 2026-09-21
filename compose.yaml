@@ -17,5 +17,18 @@ services:
       timeout: 5s
       retries: 12
 
+  atlas-control:
+    build:
+      context: ./services/atlas-control
+    container_name: atlas-control
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   postgres_data:
