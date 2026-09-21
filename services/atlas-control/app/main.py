@@ -229,6 +229,46 @@ async def create_intake_item(item: IntakeItemCreate) -> dict:
     }
 
 
+@app.get("/intake-items/{intake_id}")
+async def get_intake_item(intake_id: UUID) -> dict:
+    try:
+        async with app.state.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT
+                  intake_id, source, received_at, custodian,
+                  storage_reference, original_sha256, notes,
+                  correlation_id, created_at
+                FROM intake_items
+                WHERE intake_id = $1
+                """,
+                intake_id,
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database query failed",
+        ) from exc
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="intake item not found",
+        )
+
+    return {
+        "intake_id": str(row["intake_id"]),
+        "source": row["source"],
+        "received_at": row["received_at"].isoformat().replace("+00:00", "Z"),
+        "custodian": row["custodian"],
+        "storage_reference": row["storage_reference"],
+        "original_sha256": row["original_sha256"],
+        "notes": row["notes"],
+        "correlation_id": str(row["correlation_id"]),
+        "created_at": row["created_at"].isoformat().replace("+00:00", "Z"),
+    }
+
+
 @app.get("/intake-items")
 async def list_intake_items(
     limit: int = Query(default=50, ge=1, le=100),
