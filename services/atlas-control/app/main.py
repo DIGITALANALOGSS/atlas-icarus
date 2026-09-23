@@ -783,6 +783,8 @@ async def decide_approval_gate(
     event_id = uuid4()
     occurred_at = datetime.now(timezone.utc)
     event_type = f"governance.approval_gate.{next_status}"
+    job_row = None
+    job_event_type = None
 
     try:
         async with app.state.pool.acquire() as connection:
@@ -824,28 +826,55 @@ async def decide_approval_gate(
                         detail="approval gate is no longer pending",
                     )
 
-                payload = {
-                    "gate_id": str(gate_id),
-                    "status": next_status,
-                    "decided_by": decision.decided_by,
-                    "decision_reason": decision.decision_reason,
-                }
-                await connection.execute(
-                    """
-                    INSERT INTO events (
-                      event_id, event_type, occurred_at, producer,
-                      correlation_id, schema_version, payload
-                    )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-                    """,
-                    event_id,
-                    event_type,
-                    occurred_at,
-                    SERVICE_NAME,
-                    row["correlation_id"],
-                    "1.0",
-                    json.dumps(payload),
+                await write_event(
+                    connection,
+                    event_type=event_type,
+                    correlation_id=row["correlation_id"],
+                    occurred_at=occurred_at,
+                    payload={
+                        "gate_id": str(gate_id),
+                        "status": next_status,
+                        "decided_by": decision.decided_by,
+                        "decision_reason": decision.decision_reason,
+                    },
                 )
+
+                next_job_status = (
+                    "queued" if next_status == "approved" else "rejected"
+                )
+                completed_at = occurred_at if next_status == "rejected" else None
+
+                job_row = await connection.fetchrow(
+                    """
+                    UPDATE jobs
+                    SET status = $2, completed_at = $3
+                    WHERE approval_gate_id = $1
+                      AND status = 'pending_approval'
+                    RETURNING
+                      job_id, correlation_id, status, completed_at
+                    """,
+                    gate_id,
+                    next_job_status,
+                    completed_at,
+                )
+
+                if job_row is not None:
+                    job_event_type = (
+                        "jobs.queued"
+                        if next_status == "approved"
+                        else "jobs.rejected"
+                    )
+                    await write_event(
+                        connection,
+                        event_type=job_event_type,
+                        correlation_id=job_row["correlation_id"],
+                        occurred_at=occurred_at,
+                        payload={
+                            "job_id": str(job_row["job_id"]),
+                            "status": job_row["status"],
+                            "approval_gate_id": str(gate_id),
+                        },
+                    )
     except HTTPException:
         raise
     except Exception as exc:
@@ -854,11 +883,16 @@ async def decide_approval_gate(
             detail="database write failed",
         ) from exc
 
-    return {
+    response = {
         **serialize_approval_gate(row),
         "event_id": str(event_id),
         "event_type": event_type,
     }
+    if job_row is not None:
+        response["job_id"] = str(job_row["job_id"])
+        response["job_status"] = job_row["status"]
+        response["job_event_type"] = job_event_type
+    return response
 
 
 def serialize_job(row) -> dict:
@@ -920,23 +954,69 @@ async def create_job(job: JobCreate) -> dict:
     correlation_id = job.correlation_id or uuid4()
     created_at = datetime.now(timezone.utc)
     job_status = "pending_approval" if job.approval_required else "queued"
+    approval_gate_id = uuid4() if job.approval_required else None
 
     try:
         async with app.state.pool.acquire() as connection:
             async with connection.transaction():
+                if approval_gate_id is not None:
+                    approval_summary = (
+                        f"Approve execution of job {job_id} "
+                        f"({job.job_type})."
+                    )
+                    approval_payload = {
+                        "job_id": str(job_id),
+                        "job_type": job.job_type,
+                        "request_payload": job.request_payload,
+                    }
+
+                    await connection.execute(
+                        """
+                        INSERT INTO approval_gates (
+                          gate_id, requester, action_type, risk_level,
+                          action_payload, summary, status, correlation_id
+                        )
+                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
+                        """,
+                        approval_gate_id,
+                        SERVICE_NAME,
+                        "jobs.execute",
+                        "medium",
+                        json.dumps(approval_payload),
+                        approval_summary,
+                        "pending",
+                        correlation_id,
+                    )
+
+                    await write_event(
+                        connection,
+                        event_type="governance.approval_gate.created",
+                        correlation_id=correlation_id,
+                        occurred_at=created_at,
+                        payload={
+                            "gate_id": str(approval_gate_id),
+                            "requester": SERVICE_NAME,
+                            "action_type": "jobs.execute",
+                            "risk_level": "medium",
+                            "status": "pending",
+                            "job_id": str(job_id),
+                        },
+                    )
+
                 await connection.execute(
                     """
                     INSERT INTO jobs (
                       job_id, job_type, request_payload, status,
                       approval_required, approval_gate_id, correlation_id
                     )
-                    VALUES ($1, $2, $3::jsonb, $4, $5, NULL, $6)
+                    VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7)
                     """,
                     job_id,
                     job.job_type,
                     json.dumps(job.request_payload),
                     job_status,
                     job.approval_required,
+                    approval_gate_id,
                     correlation_id,
                 )
 
@@ -950,6 +1030,11 @@ async def create_job(job: JobCreate) -> dict:
                         "job_type": job.job_type,
                         "status": job_status,
                         "approval_required": job.approval_required,
+                        "approval_gate_id": (
+                            str(approval_gate_id)
+                            if approval_gate_id is not None
+                            else None
+                        ),
                     },
                 )
 
@@ -965,6 +1050,11 @@ async def create_job(job: JobCreate) -> dict:
                     payload={
                         "job_id": str(job_id),
                         "status": job_status,
+                        "approval_gate_id": (
+                            str(approval_gate_id)
+                            if approval_gate_id is not None
+                            else None
+                        ),
                     },
                 )
     except Exception as exc:
@@ -979,7 +1069,11 @@ async def create_job(job: JobCreate) -> dict:
         "request_payload": job.request_payload,
         "status": job_status,
         "approval_required": job.approval_required,
-        "approval_gate_id": None,
+        "approval_gate_id": (
+            str(approval_gate_id)
+            if approval_gate_id is not None
+            else None
+        ),
         "correlation_id": str(correlation_id),
         "result_payload": None,
         "error_code": None,
