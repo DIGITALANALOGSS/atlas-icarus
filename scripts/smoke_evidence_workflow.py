@@ -167,6 +167,84 @@ def main() -> None:
             f"{sorted(expected_event_types - event_types)}"
         )
 
+    approval_payload = {
+        "requester": "atlas-automation-smoke",
+        "action_type": "engineering.patch.apply",
+        "risk_level": "low",
+        "action_payload": {
+            "run_id": run_id,
+            "scope": "local synthetic smoke validation",
+        },
+        "summary": f"Synthetic Approval Gates smoke validation {run_id}.",
+        "correlation_id": correlation_id,
+    }
+    status_code, approval_gate = request(
+        "POST",
+        "/approval-gates",
+        approval_payload,
+    )
+    expect(status_code, 201, "create approval gate", approval_gate)
+
+    gate_id = approval_gate.get("gate_id")
+    if not gate_id:
+        fail(f"create approval gate: missing gate_id: {json.dumps(approval_gate)}")
+    if approval_gate.get("status") != "pending":
+        fail("create approval gate: status was not pending")
+    if approval_gate.get("correlation_id") != correlation_id:
+        fail("create approval gate: correlation ID did not match the intake")
+
+    status_code, fetched_pending_gate = request(
+        "GET",
+        f"/approval-gates/{gate_id}",
+    )
+    expect(status_code, 200, "get pending approval gate", fetched_pending_gate)
+    if fetched_pending_gate.get("status") != "pending":
+        fail("get pending approval gate: status was not pending")
+    if fetched_pending_gate.get("correlation_id") != correlation_id:
+        fail("get pending approval gate: correlation ID did not match")
+
+    status_code, pending_gates = request(
+        "GET",
+        "/approval-gates?status=pending&limit=100&offset=0",
+    )
+    expect(status_code, 200, "list pending approval gates", pending_gates)
+    pending_gate_ids = {item.get("gate_id") for item in pending_gates.get("items", [])}
+    if gate_id not in pending_gate_ids:
+        fail("list pending approval gates: created gate ID was absent")
+
+    decision_payload = {
+        "decided_by": "atlas-automation-smoke",
+        "decision_reason": "Synthetic local smoke validation completed.",
+    }
+    status_code, approved_gate = request(
+        "POST",
+        f"/approval-gates/{gate_id}/approve",
+        decision_payload,
+    )
+    expect(status_code, 200, "approve approval gate", approved_gate)
+    if approved_gate.get("status") != "approved":
+        fail("approve approval gate: status was not approved")
+    if approved_gate.get("correlation_id") != correlation_id:
+        fail("approve approval gate: correlation ID did not match")
+    if approved_gate.get("decided_by") != decision_payload["decided_by"]:
+        fail("approve approval gate: decision maker did not match")
+    if approved_gate.get("decision_reason") != decision_payload["decision_reason"]:
+        fail("approve approval gate: decision reason did not match")
+    if approved_gate.get("event_type") != "governance.approval_gate.approved":
+        fail("approve approval gate: approval event type did not match")
+
+    status_code, fetched_approved_gate = request(
+        "GET",
+        f"/approval-gates/{gate_id}",
+    )
+    expect(status_code, 200, "get approved approval gate", fetched_approved_gate)
+    if fetched_approved_gate.get("status") != "approved":
+        fail("get approved approval gate: status was not approved")
+    if fetched_approved_gate.get("correlation_id") != correlation_id:
+        fail("get approved approval gate: correlation ID did not match")
+    if fetched_approved_gate.get("decision_event_id") != approved_gate.get("event_id"):
+        fail("get approved approval gate: decision event ID did not match")
+
     print(f"PASS  correlation integrity: {correlation_id}")
     print(f"PASS  synthetic workflow ID: {run_id}")
     print("RESULT: SMOKE TEST PASSED")
