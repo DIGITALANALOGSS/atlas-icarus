@@ -460,6 +460,58 @@ async def test_decision_returns_409_when_gate_is_not_pending(install_pool):
 
 
 @pytest.mark.asyncio
+async def test_second_approval_of_same_gate_returns_409(install_pool):
+    decided_at = datetime(2026, 9, 23, 13, 7, 0, tzinfo=timezone.utc)
+    approved_gate = gate_row(
+        gate_status="approved",
+        decided_at=decided_at,
+        decided_by="freedome",
+        decision_reason="Approved once.",
+        decision_event_id=EVENT_ID,
+    )
+    connection, pool = install_pool(
+        rows=[
+            approved_gate,
+            job_row("queued"),
+            None,
+            {"status": "approved"},
+        ]
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.post(
+            f"/approval-gates/{GATE_ID}/approve",
+            json={
+                "decided_by": "freedome",
+                "decision_reason": "Approved once.",
+            },
+        )
+        second = await client.post(
+            f"/approval-gates/{GATE_ID}/approve",
+            json={
+                "decided_by": "freedome",
+                "decision_reason": "Attempted duplicate approval.",
+            },
+        )
+
+    assert first.status_code == 200
+    assert first.json()["status"] == "approved"
+    assert first.json()["job_status"] == "queued"
+
+    assert second.status_code == 409
+    assert second.json() == {"detail": "approval gate is no longer pending"}
+
+    assert pool.acquire_count == 2
+    assert connection.calls[0] == ("transaction", None, ())
+    assert connection.calls[5] == ("transaction", None, ())
+    assert connection.calls[6][0] == "fetchrow"
+    assert "UPDATE approval_gates" in connection.calls[6][1]
+    assert connection.calls[7][0] == "fetchrow"
+    assert "SELECT status FROM approval_gates" in connection.calls[7][1]
+
+
+@pytest.mark.asyncio
 async def test_approval_gate_returns_503_for_database_failure(install_pool):
     connection, pool = install_pool(error=RuntimeError("database unavailable"))
 
