@@ -164,6 +164,44 @@ class ApprovalDecisionCreate(BaseModel):
         return value or None
 
 
+JOB_TYPE_PATTERN = re.compile(r"^[a-z0-9]+(\.[a-z0-9_]+)+$")
+JOB_STATUSES = {
+    "pending_approval",
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "rejected",
+}
+
+
+class JobCreate(BaseModel):
+    job_type: str = Field(min_length=3, max_length=255)
+    request_payload: dict = Field(default_factory=dict)
+    approval_required: bool = False
+    correlation_id: UUID | None = None
+
+    @field_validator("job_type")
+    @classmethod
+    def validate_job_type(cls, value: str) -> str:
+        value = value.strip()
+        if not JOB_TYPE_PATTERN.fullmatch(value):
+            raise ValueError("must be a lowercase dotted identifier")
+        if value != "metadata.analyze":
+            raise ValueError("only metadata.analyze is supported")
+        return value
+
+    @field_validator("request_payload")
+    @classmethod
+    def validate_request_payload(cls, value: dict) -> dict:
+        content = value.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("must include nonblank string field: content")
+        if len(content) > 20000:
+            raise ValueError("content must not exceed 20000 characters")
+        return value
+
+
 async def apply_migrations(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as connection:
         await connection.execute(
@@ -821,6 +859,276 @@ async def decide_approval_gate(
         "event_id": str(event_id),
         "event_type": event_type,
     }
+
+
+def serialize_job(row) -> dict:
+    return {
+        "job_id": str(row["job_id"]),
+        "job_type": row["job_type"],
+        "request_payload": decode_json_object(row["request_payload"]),
+        "status": row["status"],
+        "approval_required": row["approval_required"],
+        "approval_gate_id": (
+            str(row["approval_gate_id"])
+            if row["approval_gate_id"] is not None
+            else None
+        ),
+        "correlation_id": str(row["correlation_id"]),
+        "result_payload": (
+            decode_json_object(row["result_payload"])
+            if row["result_payload"] is not None
+            else None
+        ),
+        "error_code": row["error_code"],
+        "created_at": serialize_datetime(row["created_at"]),
+        "started_at": serialize_datetime(row["started_at"]),
+        "completed_at": serialize_datetime(row["completed_at"]),
+    }
+
+
+async def write_event(
+    connection,
+    *,
+    event_type: str,
+    correlation_id: UUID,
+    payload: dict,
+    occurred_at: datetime | None = None,
+) -> UUID:
+    event_id = uuid4()
+    await connection.execute(
+        """
+        INSERT INTO events (
+          event_id, event_type, occurred_at, producer,
+          correlation_id, schema_version, payload
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+        """,
+        event_id,
+        event_type,
+        occurred_at or datetime.now(timezone.utc),
+        SERVICE_NAME,
+        correlation_id,
+        "1.0",
+        json.dumps(payload),
+    )
+    return event_id
+
+
+@app.post("/jobs", status_code=status.HTTP_201_CREATED)
+async def create_job(job: JobCreate) -> dict:
+    job_id = uuid4()
+    correlation_id = job.correlation_id or uuid4()
+    created_at = datetime.now(timezone.utc)
+    job_status = "pending_approval" if job.approval_required else "queued"
+
+    try:
+        async with app.state.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    INSERT INTO jobs (
+                      job_id, job_type, request_payload, status,
+                      approval_required, approval_gate_id, correlation_id
+                    )
+                    VALUES ($1, $2, $3::jsonb, $4, $5, NULL, $6)
+                    """,
+                    job_id,
+                    job.job_type,
+                    json.dumps(job.request_payload),
+                    job_status,
+                    job.approval_required,
+                    correlation_id,
+                )
+
+                await write_event(
+                    connection,
+                    event_type="jobs.created",
+                    correlation_id=correlation_id,
+                    occurred_at=created_at,
+                    payload={
+                        "job_id": str(job_id),
+                        "job_type": job.job_type,
+                        "status": job_status,
+                        "approval_required": job.approval_required,
+                    },
+                )
+
+                await write_event(
+                    connection,
+                    event_type=(
+                        "jobs.approval_requested"
+                        if job.approval_required
+                        else "jobs.queued"
+                    ),
+                    correlation_id=correlation_id,
+                    occurred_at=created_at,
+                    payload={
+                        "job_id": str(job_id),
+                        "status": job_status,
+                    },
+                )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database write failed",
+        ) from exc
+
+    return {
+        "job_id": str(job_id),
+        "job_type": job.job_type,
+        "request_payload": job.request_payload,
+        "status": job_status,
+        "approval_required": job.approval_required,
+        "approval_gate_id": None,
+        "correlation_id": str(correlation_id),
+        "result_payload": None,
+        "error_code": None,
+        "created_at": serialize_datetime(created_at),
+        "started_at": None,
+        "completed_at": None,
+    }
+
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: UUID) -> dict:
+    try:
+        async with app.state.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT
+                  job_id, job_type, request_payload, status,
+                  approval_required, approval_gate_id, correlation_id,
+                  result_payload, error_code, created_at, started_at, completed_at
+                FROM jobs
+                WHERE job_id = $1
+                """,
+                job_id,
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database query failed",
+        ) from exc
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="job not found",
+        )
+
+    return serialize_job(row)
+
+
+@app.post("/jobs/{job_id}/execute")
+async def execute_job(job_id: UUID) -> dict:
+    started_at = datetime.now(timezone.utc)
+
+    try:
+        async with app.state.pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    UPDATE jobs
+                    SET status = 'running', started_at = $2
+                    WHERE job_id = $1 AND status = 'queued'
+                    RETURNING
+                      job_id, job_type, request_payload, status,
+                      approval_required, approval_gate_id, correlation_id,
+                      result_payload, error_code, created_at, started_at, completed_at
+                    """,
+                    job_id,
+                    started_at,
+                )
+
+                if row is None:
+                    existing = await connection.fetchrow(
+                        """
+                        SELECT status
+                        FROM jobs
+                        WHERE job_id = $1
+                        """,
+                        job_id,
+                    )
+                    if existing is None:
+                        raise HTTPException(
+                            status_code=status.HTTP_404_NOT_FOUND,
+                            detail="job not found",
+                        )
+                    if existing["status"] == "pending_approval":
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="job is awaiting approval",
+                        )
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="job is not queued",
+                    )
+
+                await write_event(
+                    connection,
+                    event_type="jobs.started",
+                    correlation_id=row["correlation_id"],
+                    occurred_at=started_at,
+                    payload={
+                        "job_id": str(row["job_id"]),
+                        "status": "running",
+                    },
+                )
+
+                request_payload = decode_json_object(row["request_payload"])
+                content = request_payload["content"]
+                completed_at = datetime.now(timezone.utc)
+                result_payload = {
+                    "char_count": len(content),
+                    "word_count": len(content.split()),
+                    "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    "analyzed_at": serialize_datetime(completed_at),
+                }
+
+                completed = await connection.fetchrow(
+                    """
+                    UPDATE jobs
+                    SET
+                      status = 'succeeded',
+                      result_payload = $2::jsonb,
+                      completed_at = $3
+                    WHERE job_id = $1 AND status = 'running'
+                    RETURNING
+                      job_id, job_type, request_payload, status,
+                      approval_required, approval_gate_id, correlation_id,
+                      result_payload, error_code, created_at, started_at, completed_at
+                    """,
+                    job_id,
+                    json.dumps(result_payload),
+                    completed_at,
+                )
+
+                if completed is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="job could not be completed",
+                    )
+
+                await write_event(
+                    connection,
+                    event_type="jobs.succeeded",
+                    correlation_id=completed["correlation_id"],
+                    occurred_at=completed_at,
+                    payload={
+                        "job_id": str(completed["job_id"]),
+                        "status": "succeeded",
+                        "result_sha256": result_payload["sha256"],
+                    },
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database write failed",
+        ) from exc
+
+    return serialize_job(completed)
 
 
 @app.post("/approval-gates/{gate_id}/approve")
