@@ -19,6 +19,7 @@ SECOND_GATE_ID = UUID("d287f846-e7fd-4081-9d66-006206df885d")
 MISSING_GATE_ID = UUID("e387f846-e7fd-4081-9d66-006206df885d")
 EVENT_ID = UUID("f487f846-e7fd-4081-9d66-006206df885d")
 CORRELATION_ID = UUID("9cfcc9ce-c53b-4ab5-a1d4-293f9d07022e")
+JOB_ID = UUID("a487f846-e7fd-4081-9d66-006206df885d")
 
 
 class FakeTransaction:
@@ -121,6 +122,15 @@ def create_payload():
         },
         "summary": "  Apply the reviewed Approval Gates implementation.  ",
         "correlation_id": str(CORRELATION_ID),
+    }
+
+
+def job_row(status, completed_at=None):
+    return {
+        "job_id": JOB_ID,
+        "correlation_id": CORRELATION_ID,
+        "status": status,
+        "completed_at": completed_at,
     }
 
 
@@ -286,16 +296,16 @@ async def test_create_approval_gate_rejects_invalid_payload(install_pool):
 
 
 @pytest.mark.asyncio
-async def test_approve_pending_gate_updates_gate_and_writes_event(install_pool):
+async def test_approve_pending_gate_queues_linked_job_and_writes_events(install_pool):
     decided_at = datetime(2026, 9, 23, 13, 5, 0, tzinfo=timezone.utc)
-    row = gate_row(
+    gate = gate_row(
         gate_status="approved",
         decided_at=decided_at,
         decided_by="freedome",
         decision_reason="Tests passed and the change is reviewed.",
         decision_event_id=EVENT_ID,
     )
-    connection, pool = install_pool(rows=[row])
+    connection, pool = install_pool(rows=[gate, job_row("queued")])
 
     payload = {
         "decided_by": "  freedome  ",
@@ -317,34 +327,51 @@ async def test_approve_pending_gate_updates_gate_and_writes_event(install_pool):
     assert UUID(body["event_id"])
     assert body["event_id"] != body["decision_event_id"]
     assert body["event_type"] == "governance.approval_gate.approved"
+    assert body["job_id"] == str(JOB_ID)
+    assert body["job_status"] == "queued"
+    assert body["job_event_type"] == "jobs.queued"
 
     assert pool.acquire_count == 1
     assert connection.calls[0] == ("transaction", None, ())
-    update_call = connection.calls[1]
-    assert update_call[0] == "fetchrow"
-    assert "UPDATE approval_gates" in update_call[1]
-    assert "WHERE gate_id = $1 AND status = 'pending'" in update_call[1]
-    assert update_call[2][0] == GATE_ID
-    assert update_call[2][1] == "approved"
 
-    event_call = connection.calls[2]
-    assert event_call[0] == "execute"
-    assert "INSERT INTO events" in event_call[1]
-    assert event_call[2][1] == "governance.approval_gate.approved"
-    assert event_call[2][4] == CORRELATION_ID
+    gate_update = connection.calls[1]
+    assert gate_update[0] == "fetchrow"
+    assert "UPDATE approval_gates" in gate_update[1]
+    assert "WHERE gate_id = $1 AND status = 'pending'" in gate_update[1]
+    assert gate_update[2][0] == GATE_ID
+    assert gate_update[2][1] == "approved"
+
+    approval_event = connection.calls[2]
+    assert approval_event[0] == "execute"
+    assert "INSERT INTO events" in approval_event[1]
+    assert approval_event[2][1] == "governance.approval_gate.approved"
+    assert approval_event[2][4] == CORRELATION_ID
+
+    job_update = connection.calls[3]
+    assert job_update[0] == "fetchrow"
+    assert "UPDATE jobs" in job_update[1]
+    assert "WHERE approval_gate_id = $1" in job_update[1]
+    assert "AND status = 'pending_approval'" in job_update[1]
+    assert job_update[2] == (GATE_ID, "queued", None)
+
+    job_event = connection.calls[4]
+    assert job_event[0] == "execute"
+    assert "INSERT INTO events" in job_event[1]
+    assert job_event[2][1] == "jobs.queued"
+    assert job_event[2][4] == CORRELATION_ID
 
 
 @pytest.mark.asyncio
-async def test_reject_pending_gate_updates_gate_and_writes_event(install_pool):
+async def test_reject_pending_gate_rejects_linked_job_and_writes_events(install_pool):
     decided_at = datetime(2026, 9, 23, 13, 6, 0, tzinfo=timezone.utc)
-    row = gate_row(
+    gate = gate_row(
         gate_status="rejected",
         decided_at=decided_at,
         decided_by="freedome",
         decision_reason=None,
         decision_event_id=EVENT_ID,
     )
-    connection, pool = install_pool(rows=[row])
+    connection, pool = install_pool(rows=[gate, job_row("rejected", decided_at)])
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -359,13 +386,39 @@ async def test_reject_pending_gate_updates_gate_and_writes_event(install_pool):
     assert body["decided_by"] == "freedome"
     assert body["decision_reason"] is None
     assert body["event_type"] == "governance.approval_gate.rejected"
+    assert body["job_id"] == str(JOB_ID)
+    assert body["job_status"] == "rejected"
+    assert body["job_event_type"] == "jobs.rejected"
 
     assert pool.acquire_count == 1
     assert connection.calls[0] == ("transaction", None, ())
-    assert "UPDATE approval_gates" in connection.calls[1][1]
-    assert connection.calls[1][2][1] == "rejected"
-    assert "INSERT INTO events" in connection.calls[2][1]
-    assert connection.calls[2][2][1] == "governance.approval_gate.rejected"
+
+    gate_update = connection.calls[1]
+    assert gate_update[0] == "fetchrow"
+    assert "UPDATE approval_gates" in gate_update[1]
+    assert gate_update[2][1] == "rejected"
+
+    approval_event = connection.calls[2]
+    assert approval_event[0] == "execute"
+    assert "INSERT INTO events" in approval_event[1]
+    assert approval_event[2][1] == "governance.approval_gate.rejected"
+    assert approval_event[2][4] == CORRELATION_ID
+
+    job_update = connection.calls[3]
+    assert job_update[0] == "fetchrow"
+    assert "UPDATE jobs" in job_update[1]
+    assert "WHERE approval_gate_id = $1" in job_update[1]
+    assert "AND status = 'pending_approval'" in job_update[1]
+    assert job_update[2][0] == GATE_ID
+    assert job_update[2][1] == "rejected"
+    assert isinstance(job_update[2][2], datetime)
+    assert job_update[2][2].tzinfo is not None
+
+    job_event = connection.calls[4]
+    assert job_event[0] == "execute"
+    assert "INSERT INTO events" in job_event[1]
+    assert job_event[2][1] == "jobs.rejected"
+    assert job_event[2][4] == CORRELATION_ID
 
 
 @pytest.mark.asyncio
