@@ -9,7 +9,8 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import asyncpg
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
+from app.auth import Principal, require_permission
 from pydantic import BaseModel, Field, field_validator
 
 SERVICE_NAME = "atlas-control"
@@ -621,7 +622,10 @@ async def list_intake_events(intake_id: UUID) -> dict:
 
 
 @app.post("/approval-gates", status_code=status.HTTP_201_CREATED)
-async def create_approval_gate(gate: ApprovalGateCreate) -> dict:
+async def create_approval_gate(
+    gate: ApprovalGateCreate,
+    principal: Principal = Depends(require_permission("approval-gates:create")),
+) -> dict:
     gate_id = uuid4()
     event_id = uuid4()
     correlation_id = gate.correlation_id or uuid4()
@@ -688,7 +692,10 @@ async def create_approval_gate(gate: ApprovalGateCreate) -> dict:
 
 
 @app.get("/approval-gates/{gate_id}")
-async def get_approval_gate(gate_id: UUID) -> dict:
+async def get_approval_gate(
+    gate_id: UUID,
+    principal: Principal = Depends(require_permission("approval-gates:read")),
+) -> dict:
     try:
         async with app.state.pool.acquire() as connection:
             row = await connection.fetchrow(
@@ -722,6 +729,7 @@ async def list_approval_gates(
     gate_status: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(require_permission("approval-gates:read")),
 ) -> dict:
     if gate_status is not None and gate_status not in APPROVAL_STATUSES:
         raise HTTPException(
@@ -1229,6 +1237,7 @@ async def execute_job(job_id: UUID) -> dict:
 async def approve_approval_gate(
     gate_id: UUID,
     decision: ApprovalDecisionCreate,
+    principal: Principal = Depends(require_permission("approval-gates:decide")),
 ) -> dict:
     return await decide_approval_gate(gate_id, decision, "approved")
 
@@ -1237,5 +1246,6 @@ async def approve_approval_gate(
 async def reject_approval_gate(
     gate_id: UUID,
     decision: ApprovalDecisionCreate,
+    principal: Principal = Depends(require_permission("approval-gates:decide")),
 ) -> dict:
     return await decide_approval_gate(gate_id, decision, "rejected")

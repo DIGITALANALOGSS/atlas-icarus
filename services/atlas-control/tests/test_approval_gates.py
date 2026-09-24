@@ -13,6 +13,11 @@ sys.path.insert(0, str(APP_ROOT))
 
 from app.main import app
 
+DEFAULT_HEADERS = {"Authorization": "Bearer dev-admin"}
+REQUESTER_HEADERS = {"Authorization": "Bearer dev-requester"}
+APPROVER_HEADERS = {"Authorization": "Bearer dev-approver"}
+WORKER_HEADERS = {"Authorization": "Bearer dev-worker"}
+
 
 GATE_ID = UUID("c187f846-e7fd-4081-9d66-006206df885d")
 SECOND_GATE_ID = UUID("d287f846-e7fd-4081-9d66-006206df885d")
@@ -140,7 +145,7 @@ async def test_create_approval_gate_persists_pending_gate_and_event(install_pool
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/approval-gates", json=create_payload())
+        response = await client.post("/approval-gates", json=create_payload(), headers=REQUESTER_HEADERS)
 
     assert response.status_code == 201
     body = response.json()
@@ -177,7 +182,7 @@ async def test_get_approval_gate_returns_serialized_gate(install_pool):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get(f"/approval-gates/{GATE_ID}")
+        response = await client.get(f"/approval-gates/{GATE_ID}", headers=DEFAULT_HEADERS)
 
     assert response.status_code == 200
     assert response.json() == {
@@ -214,7 +219,7 @@ async def test_get_approval_gate_returns_404_when_missing(install_pool):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get(f"/approval-gates/{MISSING_GATE_ID}")
+        response = await client.get(f"/approval-gates/{MISSING_GATE_ID}", headers=DEFAULT_HEADERS)
 
     assert response.status_code == 404
     assert response.json() == {"detail": "approval gate not found"}
@@ -233,7 +238,7 @@ async def test_list_approval_gates_filters_by_status(install_pool):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/approval-gates?status=pending&limit=2&offset=1")
+        response = await client.get("/approval-gates?status=pending&limit=2&offset=1", headers=DEFAULT_HEADERS)
 
     assert response.status_code == 200
     body = response.json()
@@ -272,7 +277,7 @@ async def test_approval_gate_routes_reject_invalid_parameters(install_pool, path
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get(path)
+        response = await client.get(path, headers=DEFAULT_HEADERS)
 
     assert response.status_code == 422
     assert connection.calls == []
@@ -288,7 +293,7 @@ async def test_create_approval_gate_rejects_invalid_payload(install_pool):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/approval-gates", json=payload)
+        response = await client.post("/approval-gates", json=payload, headers=REQUESTER_HEADERS)
 
     assert response.status_code == 422
     assert connection.calls == []
@@ -316,6 +321,7 @@ async def test_approve_pending_gate_queues_linked_job_and_writes_events(install_
         response = await client.post(
             f"/approval-gates/{GATE_ID}/approve",
             json=payload,
+            headers=APPROVER_HEADERS,
         )
 
     assert response.status_code == 200
@@ -378,6 +384,7 @@ async def test_reject_pending_gate_rejects_linked_job_and_writes_events(install_
         response = await client.post(
             f"/approval-gates/{GATE_ID}/reject",
             json={"decided_by": "freedome"},
+            headers=APPROVER_HEADERS,
         )
 
     assert response.status_code == 200
@@ -430,6 +437,7 @@ async def test_decision_returns_404_when_gate_does_not_exist(install_pool):
         response = await client.post(
             f"/approval-gates/{MISSING_GATE_ID}/approve",
             json={"decided_by": "freedome"},
+            headers=APPROVER_HEADERS,
         )
 
     assert response.status_code == 404
@@ -449,6 +457,7 @@ async def test_decision_returns_409_when_gate_is_not_pending(install_pool):
         response = await client.post(
             f"/approval-gates/{GATE_ID}/reject",
             json={"decided_by": "freedome"},
+            headers=APPROVER_HEADERS,
         )
 
     assert response.status_code == 409
@@ -486,6 +495,7 @@ async def test_second_approval_of_same_gate_returns_409(install_pool):
                 "decided_by": "freedome",
                 "decision_reason": "Approved once.",
             },
+            headers=APPROVER_HEADERS,
         )
         second = await client.post(
             f"/approval-gates/{GATE_ID}/approve",
@@ -493,6 +503,7 @@ async def test_second_approval_of_same_gate_returns_409(install_pool):
                 "decided_by": "freedome",
                 "decision_reason": "Attempted duplicate approval.",
             },
+            headers=APPROVER_HEADERS,
         )
 
     assert first.status_code == 200
@@ -517,7 +528,7 @@ async def test_approval_gate_returns_503_for_database_failure(install_pool):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get(f"/approval-gates/{GATE_ID}")
+        response = await client.get(f"/approval-gates/{GATE_ID}", headers=DEFAULT_HEADERS)
 
     assert response.status_code == 503
     assert response.json() == {"detail": "database query failed"}
