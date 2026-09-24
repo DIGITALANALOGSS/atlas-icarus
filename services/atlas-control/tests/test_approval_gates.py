@@ -11,6 +11,7 @@ import sys
 APP_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_ROOT))
 
+from app.auth import DEFAULT_TENANT_ID
 from app.main import app
 
 DEFAULT_HEADERS = {"Authorization": "Bearer dev-admin"}
@@ -170,6 +171,7 @@ async def test_create_approval_gate_persists_pending_gate_and_event(install_pool
     assert execute_calls[0][2][3] == "high"
     assert execute_calls[0][2][6] == "pending"
     assert execute_calls[0][2][7] == CORRELATION_ID
+    assert execute_calls[0][2][8] == DEFAULT_TENANT_ID
     assert "INSERT INTO events" in execute_calls[1][1]
     assert execute_calls[1][2][1] == "governance.approval_gate.created"
     assert execute_calls[1][2][4] == CORRELATION_ID
@@ -209,8 +211,8 @@ async def test_get_approval_gate_returns_serialized_gate(install_pool):
     method, query, args = connection.calls[0]
     assert method == "fetchrow"
     assert "FROM approval_gates" in query
-    assert "WHERE gate_id = $1" in query
-    assert args == (GATE_ID,)
+    assert "WHERE gate_id = $1 AND tenant_id = $2" in query
+    assert args == (GATE_ID, DEFAULT_TENANT_ID)
 
 
 @pytest.mark.asyncio
@@ -255,10 +257,10 @@ async def test_list_approval_gates_filters_by_status(install_pool):
     method, query, args = connection.calls[0]
     assert method == "fetch"
     assert "FROM approval_gates" in query
-    assert "WHERE status = $1" in query
+    assert "WHERE tenant_id = $1 AND status = $2" in query
     assert "ORDER BY created_at DESC, gate_id DESC" in query
-    assert "LIMIT $2 OFFSET $3" in query
-    assert args == ("pending", 2, 1)
+    assert "LIMIT $3 OFFSET $4" in query
+    assert args == (DEFAULT_TENANT_ID, "pending", 2, 1)
 
 
 @pytest.mark.asyncio
@@ -343,9 +345,12 @@ async def test_approve_pending_gate_queues_linked_job_and_writes_events(install_
     gate_update = connection.calls[1]
     assert gate_update[0] == "fetchrow"
     assert "UPDATE approval_gates" in gate_update[1]
-    assert "WHERE gate_id = $1 AND status = 'pending'" in gate_update[1]
+    assert "WHERE gate_id = $1" in gate_update[1]
+    assert "AND tenant_id = $2" in gate_update[1]
+    assert "AND status = 'pending'" in gate_update[1]
     assert gate_update[2][0] == GATE_ID
-    assert gate_update[2][1] == "approved"
+    assert gate_update[2][1] == DEFAULT_TENANT_ID
+    assert gate_update[2][2] == "approved"
 
     approval_event = connection.calls[2]
     assert approval_event[0] == "execute"
@@ -357,8 +362,9 @@ async def test_approve_pending_gate_queues_linked_job_and_writes_events(install_
     assert job_update[0] == "fetchrow"
     assert "UPDATE jobs" in job_update[1]
     assert "WHERE approval_gate_id = $1" in job_update[1]
+    assert "AND tenant_id = $2" in job_update[1]
     assert "AND status = 'pending_approval'" in job_update[1]
-    assert job_update[2] == (GATE_ID, "queued", None)
+    assert job_update[2] == (GATE_ID, DEFAULT_TENANT_ID, "queued", None)
 
     job_event = connection.calls[4]
     assert job_event[0] == "execute"
@@ -403,7 +409,8 @@ async def test_reject_pending_gate_rejects_linked_job_and_writes_events(install_
     gate_update = connection.calls[1]
     assert gate_update[0] == "fetchrow"
     assert "UPDATE approval_gates" in gate_update[1]
-    assert gate_update[2][1] == "rejected"
+    assert gate_update[2][1] == DEFAULT_TENANT_ID
+    assert gate_update[2][2] == "rejected"
 
     approval_event = connection.calls[2]
     assert approval_event[0] == "execute"
@@ -415,11 +422,13 @@ async def test_reject_pending_gate_rejects_linked_job_and_writes_events(install_
     assert job_update[0] == "fetchrow"
     assert "UPDATE jobs" in job_update[1]
     assert "WHERE approval_gate_id = $1" in job_update[1]
+    assert "AND tenant_id = $2" in job_update[1]
     assert "AND status = 'pending_approval'" in job_update[1]
     assert job_update[2][0] == GATE_ID
-    assert job_update[2][1] == "rejected"
-    assert isinstance(job_update[2][2], datetime)
-    assert job_update[2][2].tzinfo is not None
+    assert job_update[2][1] == DEFAULT_TENANT_ID
+    assert job_update[2][2] == "rejected"
+    assert isinstance(job_update[2][3], datetime)
+    assert job_update[2][3].tzinfo is not None
 
     job_event = connection.calls[4]
     assert job_event[0] == "execute"
@@ -519,7 +528,10 @@ async def test_second_approval_of_same_gate_returns_409(install_pool):
     assert connection.calls[6][0] == "fetchrow"
     assert "UPDATE approval_gates" in connection.calls[6][1]
     assert connection.calls[7][0] == "fetchrow"
-    assert "SELECT status FROM approval_gates" in connection.calls[7][1]
+    assert "SELECT status" in connection.calls[7][1]
+    assert "FROM approval_gates" in connection.calls[7][1]
+    assert "WHERE gate_id = $1 AND tenant_id = $2" in connection.calls[7][1]
+    assert connection.calls[7][2] == (GATE_ID, DEFAULT_TENANT_ID)
 
 
 @pytest.mark.asyncio

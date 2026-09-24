@@ -647,9 +647,9 @@ async def create_approval_gate(
                     """
                     INSERT INTO approval_gates (
                       gate_id, requester, action_type, risk_level,
-                      action_payload, summary, status, correlation_id
+                      action_payload, summary, status, correlation_id, tenant_id
                     )
-                    VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
                     """,
                     gate_id,
                     gate.requester,
@@ -659,6 +659,7 @@ async def create_approval_gate(
                     gate.summary,
                     "pending",
                     correlation_id,
+                    principal.tenant_id,
                 )
                 await connection.execute(
                     """
@@ -705,9 +706,10 @@ async def get_approval_gate(
                   summary, status, correlation_id, created_at, decided_at,
                   decided_by, decision_reason, decision_event_id
                 FROM approval_gates
-                WHERE gate_id = $1
+                WHERE gate_id = $1 AND tenant_id = $2
                 """,
                 gate_id,
+                principal.tenant_id,
             )
     except Exception as exc:
         raise HTTPException(
@@ -747,9 +749,11 @@ async def list_approval_gates(
                       summary, status, correlation_id, created_at, decided_at,
                       decided_by, decision_reason, decision_event_id
                     FROM approval_gates
+                    WHERE tenant_id = $1
                     ORDER BY created_at DESC, gate_id DESC
-                    LIMIT $1 OFFSET $2
+                    LIMIT $2 OFFSET $3
                     """,
+                    principal.tenant_id,
                     limit,
                     offset,
                 )
@@ -761,10 +765,11 @@ async def list_approval_gates(
                       summary, status, correlation_id, created_at, decided_at,
                       decided_by, decision_reason, decision_event_id
                     FROM approval_gates
-                    WHERE status = $1
+                    WHERE tenant_id = $1 AND status = $2
                     ORDER BY created_at DESC, gate_id DESC
-                    LIMIT $2 OFFSET $3
+                    LIMIT $3 OFFSET $4
                     """,
+                    principal.tenant_id,
                     gate_status,
                     limit,
                     offset,
@@ -787,6 +792,7 @@ async def decide_approval_gate(
     gate_id: UUID,
     decision: ApprovalDecisionCreate,
     next_status: str,
+    principal: Principal,
 ) -> dict:
     event_id = uuid4()
     occurred_at = datetime.now(timezone.utc)
@@ -801,18 +807,21 @@ async def decide_approval_gate(
                     """
                     UPDATE approval_gates
                     SET
-                      status = $2,
-                      decided_at = $3,
-                      decided_by = $4,
-                      decision_reason = $5,
-                      decision_event_id = $6
-                    WHERE gate_id = $1 AND status = 'pending'
+                      status = $3,
+                      decided_at = $4,
+                      decided_by = $5,
+                      decision_reason = $6,
+                      decision_event_id = $7
+                    WHERE gate_id = $1
+                      AND tenant_id = $2
+                      AND status = 'pending'
                     RETURNING
                       gate_id, requester, action_type, risk_level, action_payload,
                       summary, status, correlation_id, created_at, decided_at,
                       decided_by, decision_reason, decision_event_id
                     """,
                     gate_id,
+                    principal.tenant_id,
                     next_status,
                     occurred_at,
                     decision.decided_by,
@@ -821,8 +830,13 @@ async def decide_approval_gate(
                 )
                 if row is None:
                     existing = await connection.fetchrow(
-                        "SELECT status FROM approval_gates WHERE gate_id = $1",
+                        """
+                        SELECT status
+                        FROM approval_gates
+                        WHERE gate_id = $1 AND tenant_id = $2
+                        """,
                         gate_id,
+                        principal.tenant_id,
                     )
                     if existing is None:
                         raise HTTPException(
@@ -855,13 +869,15 @@ async def decide_approval_gate(
                 job_row = await connection.fetchrow(
                     """
                     UPDATE jobs
-                    SET status = $2, completed_at = $3
+                    SET status = $3, completed_at = $4
                     WHERE approval_gate_id = $1
+                      AND tenant_id = $2
                       AND status = 'pending_approval'
                     RETURNING
                       job_id, correlation_id, status, completed_at
                     """,
                     gate_id,
+                    principal.tenant_id,
                     next_job_status,
                     completed_at,
                 )
@@ -957,7 +973,10 @@ async def write_event(
 
 
 @app.post("/jobs", status_code=status.HTTP_201_CREATED)
-async def create_job(job: JobCreate) -> dict:
+async def create_job(
+    job: JobCreate,
+    principal: Principal = Depends(require_permission("jobs:create")),
+) -> dict:
     job_id = uuid4()
     correlation_id = job.correlation_id or uuid4()
     created_at = datetime.now(timezone.utc)
@@ -982,9 +1001,9 @@ async def create_job(job: JobCreate) -> dict:
                         """
                         INSERT INTO approval_gates (
                           gate_id, requester, action_type, risk_level,
-                          action_payload, summary, status, correlation_id
+                          action_payload, summary, status, correlation_id, tenant_id
                         )
-                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
+                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
                         """,
                         approval_gate_id,
                         SERVICE_NAME,
@@ -994,6 +1013,7 @@ async def create_job(job: JobCreate) -> dict:
                         approval_summary,
                         "pending",
                         correlation_id,
+                        principal.tenant_id,
                     )
 
                     await write_event(
@@ -1015,9 +1035,9 @@ async def create_job(job: JobCreate) -> dict:
                     """
                     INSERT INTO jobs (
                       job_id, job_type, request_payload, status,
-                      approval_required, approval_gate_id, correlation_id
+                      approval_required, approval_gate_id, correlation_id, tenant_id
                     )
-                    VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7)
+                    VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8)
                     """,
                     job_id,
                     job.job_type,
@@ -1026,6 +1046,7 @@ async def create_job(job: JobCreate) -> dict:
                     job.approval_required,
                     approval_gate_id,
                     correlation_id,
+                    principal.tenant_id,
                 )
 
                 await write_event(
@@ -1092,7 +1113,10 @@ async def create_job(job: JobCreate) -> dict:
 
 
 @app.get("/jobs/{job_id}")
-async def get_job(job_id: UUID) -> dict:
+async def get_job(
+    job_id: UUID,
+    principal: Principal = Depends(require_permission("jobs:read")),
+) -> dict:
     try:
         async with app.state.pool.acquire() as connection:
             row = await connection.fetchrow(
@@ -1102,9 +1126,10 @@ async def get_job(job_id: UUID) -> dict:
                   approval_required, approval_gate_id, correlation_id,
                   result_payload, error_code, created_at, started_at, completed_at
                 FROM jobs
-                WHERE job_id = $1
+                WHERE job_id = $1 AND tenant_id = $2
                 """,
                 job_id,
+                principal.tenant_id,
             )
     except Exception as exc:
         raise HTTPException(
@@ -1122,7 +1147,10 @@ async def get_job(job_id: UUID) -> dict:
 
 
 @app.post("/jobs/{job_id}/execute")
-async def execute_job(job_id: UUID) -> dict:
+async def execute_job(
+    job_id: UUID,
+    principal: Principal = Depends(require_permission("jobs:execute")),
+) -> dict:
     started_at = datetime.now(timezone.utc)
 
     try:
@@ -1131,14 +1159,17 @@ async def execute_job(job_id: UUID) -> dict:
                 row = await connection.fetchrow(
                     """
                     UPDATE jobs
-                    SET status = 'running', started_at = $2
-                    WHERE job_id = $1 AND status = 'queued'
+                    SET status = 'running', started_at = $3
+                    WHERE job_id = $1
+                      AND tenant_id = $2
+                      AND status = 'queued'
                     RETURNING
                       job_id, job_type, request_payload, status,
                       approval_required, approval_gate_id, correlation_id,
                       result_payload, error_code, created_at, started_at, completed_at
                     """,
                     job_id,
+                    principal.tenant_id,
                     started_at,
                 )
 
@@ -1147,9 +1178,10 @@ async def execute_job(job_id: UUID) -> dict:
                         """
                         SELECT status
                         FROM jobs
-                        WHERE job_id = $1
+                        WHERE job_id = $1 AND tenant_id = $2
                         """,
                         job_id,
+                        principal.tenant_id,
                     )
                     if existing is None:
                         raise HTTPException(
@@ -1192,15 +1224,18 @@ async def execute_job(job_id: UUID) -> dict:
                     UPDATE jobs
                     SET
                       status = 'succeeded',
-                      result_payload = $2::jsonb,
-                      completed_at = $3
-                    WHERE job_id = $1 AND status = 'running'
+                      result_payload = $3::jsonb,
+                      completed_at = $4
+                    WHERE job_id = $1
+                      AND tenant_id = $2
+                      AND status = 'running'
                     RETURNING
                       job_id, job_type, request_payload, status,
                       approval_required, approval_gate_id, correlation_id,
                       result_payload, error_code, created_at, started_at, completed_at
                     """,
                     job_id,
+                    principal.tenant_id,
                     json.dumps(result_payload),
                     completed_at,
                 )
@@ -1239,7 +1274,7 @@ async def approve_approval_gate(
     decision: ApprovalDecisionCreate,
     principal: Principal = Depends(require_permission("approval-gates:decide")),
 ) -> dict:
-    return await decide_approval_gate(gate_id, decision, "approved")
+    return await decide_approval_gate(gate_id, decision, "approved", principal)
 
 
 @app.post("/approval-gates/{gate_id}/reject")
@@ -1248,4 +1283,4 @@ async def reject_approval_gate(
     decision: ApprovalDecisionCreate,
     principal: Principal = Depends(require_permission("approval-gates:decide")),
 ) -> dict:
-    return await decide_approval_gate(gate_id, decision, "rejected")
+    return await decide_approval_gate(gate_id, decision, "rejected", principal)
