@@ -378,12 +378,13 @@ async def create_intake_item(
                 await connection.execute(
                     """
                     INSERT INTO events (
-                      event_id, event_type, occurred_at, producer,
+                      event_id, tenant_id, event_type, occurred_at, producer,
                       correlation_id, schema_version, payload
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
                     """,
                     event_id,
+                    principal.tenant_id,
                     "research.intake.created",
                     occurred_at,
                     SERVICE_NAME,
@@ -505,12 +506,13 @@ async def create_evidence_record(
                 await connection.execute(
                     """
                     INSERT INTO events (
-                      event_id, event_type, occurred_at, producer,
+                      event_id, tenant_id, event_type, occurred_at, producer,
                       correlation_id, schema_version, payload
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
                     """,
                     event_id,
+                    principal.tenant_id,
                     "research.evidence.recorded",
                     occurred_at,
                     SERVICE_NAME,
@@ -632,9 +634,11 @@ async def list_intake_events(
               payload
             FROM events
             WHERE correlation_id = $1
+            AND tenant_id = $2
             ORDER BY occurred_at ASC, event_id ASC
             """,
             intake["correlation_id"],
+            principal.tenant_id,
         )
 
     return {
@@ -698,12 +702,13 @@ async def create_approval_gate(
                 await connection.execute(
                     """
                     INSERT INTO events (
-                      event_id, event_type, occurred_at, producer,
+                      event_id, tenant_id, event_type, occurred_at, producer,
                       correlation_id, schema_version, payload
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
                     """,
                     event_id,
+                    principal.tenant_id,
                     "governance.approval_gate.created",
                     occurred_at,
                     SERVICE_NAME,
@@ -884,6 +889,7 @@ async def decide_approval_gate(
 
                 await write_event(
                     connection,
+                    tenant_id=principal.tenant_id,
                     event_type=event_type,
                     correlation_id=row["correlation_id"],
                     occurred_at=occurred_at,
@@ -924,6 +930,7 @@ async def decide_approval_gate(
                     )
                     await write_event(
                         connection,
+                        tenant_id=principal.tenant_id,
                         event_type=job_event_type,
                         correlation_id=job_row["correlation_id"],
                         occurred_at=occurred_at,
@@ -981,6 +988,7 @@ def serialize_job(row) -> dict:
 async def write_event(
     connection,
     *,
+    tenant_id: UUID,
     event_type: str,
     correlation_id: UUID,
     payload: dict,
@@ -990,12 +998,13 @@ async def write_event(
     await connection.execute(
         """
         INSERT INTO events (
-          event_id, event_type, occurred_at, producer,
+          event_id, tenant_id, event_type, occurred_at, producer,
           correlation_id, schema_version, payload
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
         """,
         event_id,
+        tenant_id,
         event_type,
         occurred_at or datetime.now(timezone.utc),
         SERVICE_NAME,
@@ -1052,6 +1061,7 @@ async def create_job(
 
                     await write_event(
                         connection,
+                        tenant_id=principal.tenant_id,
                         event_type="governance.approval_gate.created",
                         correlation_id=correlation_id,
                         occurred_at=created_at,
@@ -1085,6 +1095,7 @@ async def create_job(
 
                 await write_event(
                     connection,
+                    tenant_id=principal.tenant_id,
                     event_type="jobs.created",
                     correlation_id=correlation_id,
                     occurred_at=created_at,
@@ -1103,6 +1114,7 @@ async def create_job(
 
                 await write_event(
                     connection,
+                    tenant_id=principal.tenant_id,
                     event_type=(
                         "jobs.approval_requested"
                         if job.approval_required
@@ -1234,6 +1246,7 @@ async def execute_job(
 
                 await write_event(
                     connection,
+                    tenant_id=principal.tenant_id,
                     event_type="jobs.started",
                     correlation_id=row["correlation_id"],
                     occurred_at=started_at,
@@ -1282,6 +1295,7 @@ async def execute_job(
 
                 await write_event(
                     connection,
+                    tenant_id=principal.tenant_id,
                     event_type="jobs.succeeded",
                     correlation_id=completed["correlation_id"],
                     occurred_at=completed_at,
