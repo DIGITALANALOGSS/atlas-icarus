@@ -438,13 +438,24 @@ async def test_reject_pending_gate_rejects_linked_job_and_writes_events(install_
 
 
 @pytest.mark.asyncio
-async def test_decision_returns_404_when_gate_does_not_exist(install_pool):
+@pytest.mark.parametrize(
+    ("decision_path", "next_status"),
+    [
+        ("approve", "approved"),
+        ("reject", "rejected"),
+    ],
+)
+async def test_decision_returns_404_without_writes_when_gate_is_not_visible_to_tenant(
+    install_pool,
+    decision_path,
+    next_status,
+):
     connection, pool = install_pool(rows=[None, None])
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            f"/approval-gates/{MISSING_GATE_ID}/approve",
+            f"/approval-gates/{MISSING_GATE_ID}/{decision_path}",
             json={"decided_by": "freedome"},
             headers=APPROVER_HEADERS,
         )
@@ -453,8 +464,25 @@ async def test_decision_returns_404_when_gate_does_not_exist(install_pool):
     assert response.json() == {"detail": "approval gate not found"}
     assert pool.acquire_count == 1
     assert connection.calls[0] == ("transaction", None, ())
-    assert connection.calls[1][0] == "fetchrow"
-    assert connection.calls[2][0] == "fetchrow"
+    assert len(connection.calls) == 3
+
+    gate_update = connection.calls[1]
+    assert gate_update[0] == "fetchrow"
+    assert "UPDATE approval_gates" in gate_update[1]
+    assert "WHERE gate_id = $1" in gate_update[1]
+    assert "AND tenant_id = $2" in gate_update[1]
+    assert "AND status = 'pending'" in gate_update[1]
+    assert gate_update[2][0] == MISSING_GATE_ID
+    assert gate_update[2][1] == DEFAULT_TENANT_ID
+    assert gate_update[2][2] == next_status
+
+    visibility_lookup = connection.calls[2]
+    assert visibility_lookup[0] == "fetchrow"
+    assert "SELECT status" in visibility_lookup[1]
+    assert "WHERE gate_id = $1 AND tenant_id = $2" in visibility_lookup[1]
+    assert visibility_lookup[2] == (MISSING_GATE_ID, DEFAULT_TENANT_ID)
+
+    assert not any(call[0] == "execute" for call in connection.calls)
 
 
 @pytest.mark.asyncio
