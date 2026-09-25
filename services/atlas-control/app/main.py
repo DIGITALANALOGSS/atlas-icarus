@@ -336,7 +336,10 @@ async def readyz():
 
 
 @app.post("/intake-items", status_code=status.HTTP_201_CREATED)
-async def create_intake_item(item: IntakeItemCreate) -> dict:
+async def create_intake_item(
+    item: IntakeItemCreate,
+    principal: Principal = Depends(require_permission("research:intake:create")),
+) -> dict:
     intake_id = uuid4()
     event_id = uuid4()
     correlation_id = item.correlation_id or uuid4()
@@ -357,12 +360,13 @@ async def create_intake_item(item: IntakeItemCreate) -> dict:
                 await connection.execute(
                     """
                     INSERT INTO intake_items (
-                      intake_id, source, received_at, custodian,
+                      intake_id, tenant_id, source, received_at, custodian,
                       storage_reference, original_sha256, notes, correlation_id
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     """,
                     intake_id,
+                    principal.tenant_id,
                     item.source,
                     item.received_at,
                     item.custodian,
@@ -404,7 +408,10 @@ async def create_intake_item(item: IntakeItemCreate) -> dict:
 
 
 @app.get("/evidence-records/{evidence_id}")
-async def get_evidence_record(evidence_id: UUID) -> dict:
+async def get_evidence_record(
+    evidence_id: UUID,
+    principal: Principal = Depends(require_permission("research:evidence:read")),
+) -> dict:
     try:
         async with app.state.pool.acquire() as connection:
             row = await connection.fetchrow(
@@ -415,8 +422,10 @@ async def get_evidence_record(evidence_id: UUID) -> dict:
                   correlation_id, created_at
                 FROM evidence_records
                 WHERE evidence_id = $1
+                  AND tenant_id = $2
                 """,
                 evidence_id,
+                principal.tenant_id,
             )
     except Exception as exc:
         raise HTTPException(
@@ -437,7 +446,11 @@ async def get_evidence_record(evidence_id: UUID) -> dict:
     "/intake-items/{intake_id}/evidence-records",
     status_code=status.HTTP_201_CREATED,
 )
-async def create_evidence_record(intake_id: UUID, record: EvidenceRecordCreate) -> dict:
+async def create_evidence_record(
+    intake_id: UUID,
+    record: EvidenceRecordCreate,
+    principal: Principal = Depends(require_permission("research:evidence:create")),
+) -> dict:
     evidence_id = uuid4()
     event_id = uuid4()
     occurred_at = datetime.now(timezone.utc)
@@ -445,8 +458,14 @@ async def create_evidence_record(intake_id: UUID, record: EvidenceRecordCreate) 
         async with app.state.pool.acquire() as connection:
             async with connection.transaction():
                 intake = await connection.fetchrow(
-                    "SELECT correlation_id FROM intake_items WHERE intake_id = $1",
+                    """
+                    SELECT correlation_id
+                    FROM intake_items
+                    WHERE intake_id = $1
+                      AND tenant_id = $2
+                    """,
                     intake_id,
+                    principal.tenant_id,
                 )
                 if intake is None:
                     raise HTTPException(
@@ -457,12 +476,13 @@ async def create_evidence_record(intake_id: UUID, record: EvidenceRecordCreate) 
                 await connection.execute(
                     """
                     INSERT INTO evidence_records (
-                      evidence_id, intake_id, sha256, storage_reference,
+                      evidence_id, tenant_id, intake_id, sha256, storage_reference,
                       media_type, filename, description, metadata, correlation_id
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
                     """,
                     evidence_id,
+                    principal.tenant_id,
                     intake_id,
                     record.sha256,
                     record.storage_reference,
@@ -522,14 +542,21 @@ async def create_evidence_record(intake_id: UUID, record: EvidenceRecordCreate) 
 @app.get("/intake-items/{intake_id}/evidence-records")
 async def list_intake_evidence_records(
     intake_id: UUID,
+    principal: Principal = Depends(require_permission("research:evidence:read")),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ) -> dict:
     try:
         async with app.state.pool.acquire() as connection:
             intake = await connection.fetchrow(
-                "SELECT intake_id FROM intake_items WHERE intake_id = $1",
+                """
+                SELECT intake_id
+                FROM intake_items
+                WHERE intake_id = $1
+                  AND tenant_id = $2
+                """,
                 intake_id,
+                principal.tenant_id,
             )
             if intake is None:
                 raise HTTPException(
@@ -544,10 +571,12 @@ async def list_intake_evidence_records(
                   correlation_id, created_at
                 FROM evidence_records
                 WHERE intake_id = $1
+                  AND tenant_id = $2
                 ORDER BY created_at DESC, evidence_id DESC
-                LIMIT $2 OFFSET $3
+                LIMIT $3 OFFSET $4
                 """,
                 intake_id,
+                principal.tenant_id,
                 limit,
                 offset,
             )
@@ -569,15 +598,20 @@ async def list_intake_evidence_records(
 
 
 @app.get("/intake-items/{intake_id}/events")
-async def list_intake_events(intake_id: UUID) -> dict:
+async def list_intake_events(
+    intake_id: UUID,
+    principal: Principal = Depends(require_permission("research:intake:read")),
+) -> dict:
     async with app.state.pool.acquire() as connection:
         intake = await connection.fetchrow(
             """
             SELECT intake_id, correlation_id
             FROM intake_items
             WHERE intake_id = $1
+              AND tenant_id = $2
             """,
             intake_id,
+            principal.tenant_id,
         )
 
         if intake is None:
