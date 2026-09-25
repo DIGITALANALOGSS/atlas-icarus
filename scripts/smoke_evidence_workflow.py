@@ -297,6 +297,76 @@ def main() -> None:
     if fetched_job != completed_job:
         fail("get succeeded job: stored result did not match original response")
 
+    gated_content = f"Synthetic approval-gated job smoke validation {run_id}"
+    gated_job_payload = {
+        "job_type": "metadata.analyze",
+        "request_payload": {"content": gated_content},
+        "approval_required": True,
+        "correlation_id": correlation_id,
+    }
+    status_code, gated_job = request("POST", "/jobs", gated_job_payload)
+    expect(status_code, 201, "create approval-gated job", gated_job)
+
+    gated_job_id = gated_job.get("job_id")
+    gated_gate_id = gated_job.get("approval_gate_id")
+    if not gated_job_id or not gated_gate_id:
+        fail("create approval-gated job: missing job ID or approval gate ID")
+    if gated_job.get("status") != "pending_approval":
+        fail("create approval-gated job: status was not pending_approval")
+    if gated_job.get("correlation_id") != correlation_id:
+        fail("create approval-gated job: correlation ID did not match")
+
+    status_code, blocked_execution = request(
+        "POST",
+        f"/jobs/{gated_job_id}/execute",
+    )
+    expect(status_code, 409, "block unapproved job execution", blocked_execution)
+    if blocked_execution.get("detail") != "job is awaiting approval":
+        fail("block unapproved job execution: unexpected conflict detail")
+
+    approval_decision = {
+        "decided_by": "atlas-automation-smoke",
+        "decision_reason": "Synthetic approval-gated job smoke validation.",
+    }
+    status_code, approved_job_gate = request(
+        "POST",
+        f"/approval-gates/{gated_gate_id}/approve",
+        approval_decision,
+    )
+    expect(status_code, 200, "approve job execution gate", approved_job_gate)
+    if approved_job_gate.get("status") != "approved":
+        fail("approve job execution gate: status was not approved")
+    if approved_job_gate.get("job_id") != gated_job_id:
+        fail("approve job execution gate: linked job ID did not match")
+    if approved_job_gate.get("job_status") != "queued":
+        fail("approve job execution gate: linked job was not queued")
+    if approved_job_gate.get("job_event_type") != "jobs.queued":
+        fail("approve job execution gate: linked job event type did not match")
+
+    status_code, approved_job = request("GET", f"/jobs/{gated_job_id}")
+    expect(status_code, 200, "get approved job", approved_job)
+    if approved_job.get("status") != "queued":
+        fail("get approved job: status was not queued")
+
+    status_code, completed_gated_job = request(
+        "POST",
+        f"/jobs/{gated_job_id}/execute",
+    )
+    expect(status_code, 200, "execute approved job", completed_gated_job)
+    if completed_gated_job.get("status") != "succeeded":
+        fail("execute approved job: status was not succeeded")
+
+    gated_result = completed_gated_job.get("result_payload")
+    if not isinstance(gated_result, dict):
+        fail("execute approved job: missing result payload")
+    if gated_result.get("char_count") != len(gated_content):
+        fail("execute approved job: character count did not match")
+    if gated_result.get("word_count") != len(gated_content.split()):
+        fail("execute approved job: word count did not match")
+    expected_gated_sha256 = hashlib.sha256(gated_content.encode("utf-8")).hexdigest()
+    if gated_result.get("sha256") != expected_gated_sha256:
+        fail("execute approved job: SHA-256 did not match")
+
     print(f"PASS  correlation integrity: {correlation_id}")
     print(f"PASS  synthetic workflow ID: {run_id}")
     print("RESULT: SMOKE TEST PASSED")
