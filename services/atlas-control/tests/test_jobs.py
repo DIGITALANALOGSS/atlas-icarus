@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from uuid import UUID
 
@@ -16,16 +17,32 @@ from app.main import app
 
 
 DEFAULT_HEADERS = {"Authorization": "Bearer dev-admin"}
+WORKER_HEADERS = {"Authorization": "Bearer dev-worker"}
 
 JOB_ID = UUID("a487f846-e7fd-4081-9d66-006206df885d")
 MISSING_JOB_ID = UUID("b487f846-e7fd-4081-9d66-006206df885d")
 CORRELATION_ID = UUID("d487f846-e7fd-4081-9d66-006206df885d")
 
 
+class FakeTransaction:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
 class FakeConnection:
     def __init__(self, rows=None):
         self.rows = list(rows or [])
         self.calls = []
+
+    def transaction(self):
+        self.calls.append(("transaction", None, ()))
+        return FakeTransaction()
+
+    async def execute(self, query, *args):
+        self.calls.append(("execute", query, args))
 
     async def fetchrow(self, query, *args):
         self.calls.append(("fetchrow", query, args))
@@ -70,6 +87,28 @@ def job_row():
         "created_at": datetime(2026, 9, 25, 12, 0, 0, tzinfo=timezone.utc),
         "started_at": None,
         "completed_at": None,
+    }
+
+
+def executable_job_row(
+    status,
+    started_at=None,
+    completed_at=None,
+    result_payload=None,
+):
+    return {
+        "job_id": JOB_ID,
+        "job_type": "research.summarize",
+        "request_payload": '{"content":"tenant isolation execution"}',
+        "status": status,
+        "approval_required": False,
+        "approval_gate_id": None,
+        "correlation_id": CORRELATION_ID,
+        "result_payload": result_payload,
+        "error_code": None,
+        "created_at": datetime(2026, 9, 25, 12, 0, 0, tzinfo=timezone.utc),
+        "started_at": started_at,
+        "completed_at": completed_at,
     }
 
 
@@ -126,3 +165,120 @@ async def test_get_job_returns_404_when_job_is_not_visible_to_tenant(install_poo
     assert method == "fetchrow"
     assert "WHERE job_id = $1 AND tenant_id = $2" in query
     assert args == (MISSING_JOB_ID, DEFAULT_TENANT_ID)
+
+
+@pytest.mark.asyncio
+async def test_execute_queued_job_completes_and_writes_events(install_pool):
+    started = executable_job_row("running")
+    completed = executable_job_row(
+        "succeeded",
+        result_payload={
+            "char_count": len("tenant isolation execution"),
+            "word_count": 3,
+            "sha256": "98d506d5e949f90c4c637819e4aa144499a97e89d6d0c74ba510839fd1c65a52",
+            "analyzed_at": "2026-09-25T12:01:00Z",
+        },
+    )
+    connection, pool = install_pool(rows=[started, completed])
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/jobs/{JOB_ID}/execute",
+            headers=WORKER_HEADERS,
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job_id"] == str(JOB_ID)
+    assert body["status"] == "succeeded"
+    assert body["result_payload"]["char_count"] == len("tenant isolation execution")
+    assert body["result_payload"]["word_count"] == 3
+    assert (
+        body["result_payload"]["sha256"]
+        == "98d506d5e949f90c4c637819e4aa144499a97e89d6d0c74ba510839fd1c65a52"
+    )
+
+    assert pool.acquire_count == 1
+    assert connection.calls[0] == ("transaction", None, ())
+    assert len(connection.calls) == 5
+
+    start_update = connection.calls[1]
+    assert start_update[0] == "fetchrow"
+    assert "UPDATE jobs" in start_update[1]
+    assert "SET status = 'running'" in start_update[1]
+    assert "WHERE job_id = $1" in start_update[1]
+    assert "AND tenant_id = $2" in start_update[1]
+    assert "AND status = 'queued'" in start_update[1]
+    assert start_update[2][0] == JOB_ID
+    assert start_update[2][1] == DEFAULT_TENANT_ID
+    assert isinstance(start_update[2][2], datetime)
+    assert start_update[2][2].tzinfo is not None
+
+    started_event = connection.calls[2]
+    assert started_event[0] == "execute"
+    assert "INSERT INTO events" in started_event[1]
+    assert started_event[2][2] == "jobs.started"
+    assert started_event[2][5] == CORRELATION_ID
+
+    completion_update = connection.calls[3]
+    assert completion_update[0] == "fetchrow"
+    assert "UPDATE jobs" in completion_update[1]
+    assert "status = 'succeeded'" in completion_update[1]
+    assert "WHERE job_id = $1" in completion_update[1]
+    assert "AND tenant_id = $2" in completion_update[1]
+    assert "AND status = 'running'" in completion_update[1]
+    assert completion_update[2][0] == JOB_ID
+    assert completion_update[2][1] == DEFAULT_TENANT_ID
+    result_payload = json.loads(completion_update[2][2])
+    assert result_payload["char_count"] == len("tenant isolation execution")
+    assert result_payload["word_count"] == 3
+    assert (
+        result_payload["sha256"]
+        == "98d506d5e949f90c4c637819e4aa144499a97e89d6d0c74ba510839fd1c65a52"
+    )
+    assert result_payload["analyzed_at"].endswith("Z")
+    assert completion_update[2][3].tzinfo is not None
+
+    succeeded_event = connection.calls[4]
+    assert succeeded_event[0] == "execute"
+    assert "INSERT INTO events" in succeeded_event[1]
+    assert succeeded_event[2][2] == "jobs.succeeded"
+    assert succeeded_event[2][5] == CORRELATION_ID
+
+
+@pytest.mark.asyncio
+async def test_execute_job_returns_404_without_writes_when_not_visible_to_tenant(
+    install_pool,
+):
+    connection, pool = install_pool(rows=[None, None])
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/jobs/{MISSING_JOB_ID}/execute",
+            headers=WORKER_HEADERS,
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "job not found"}
+    assert pool.acquire_count == 1
+    assert connection.calls[0] == ("transaction", None, ())
+    assert len(connection.calls) == 3
+
+    queued_update = connection.calls[1]
+    assert queued_update[0] == "fetchrow"
+    assert "UPDATE jobs" in queued_update[1]
+    assert "WHERE job_id = $1" in queued_update[1]
+    assert "AND tenant_id = $2" in queued_update[1]
+    assert "AND status = 'queued'" in queued_update[1]
+    assert queued_update[2][0] == MISSING_JOB_ID
+    assert queued_update[2][1] == DEFAULT_TENANT_ID
+
+    visibility_lookup = connection.calls[2]
+    assert visibility_lookup[0] == "fetchrow"
+    assert "SELECT status" in visibility_lookup[1]
+    assert "WHERE job_id = $1 AND tenant_id = $2" in visibility_lookup[1]
+    assert visibility_lookup[2] == (MISSING_JOB_ID, DEFAULT_TENANT_ID)
+
+    assert not any(call[0] == "execute" for call in connection.calls)
