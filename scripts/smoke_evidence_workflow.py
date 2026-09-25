@@ -367,6 +367,69 @@ def main() -> None:
     if gated_result.get("sha256") != expected_gated_sha256:
         fail("execute approved job: SHA-256 did not match")
 
+    rejected_content = f"Synthetic rejected job execution smoke validation {run_id}"
+    rejected_job_payload = {
+        "job_type": "metadata.analyze",
+        "request_payload": {"content": rejected_content},
+        "approval_required": True,
+        "correlation_id": correlation_id,
+    }
+    status_code, rejected_job = request("POST", "/jobs", rejected_job_payload)
+    expect(status_code, 201, "create rejection-gated job", rejected_job)
+
+    rejected_job_id = rejected_job.get("job_id")
+    rejected_gate_id = rejected_job.get("approval_gate_id")
+    if not rejected_job_id or not rejected_gate_id:
+        fail(
+            "create rejection-gated job: missing job_id or approval_gate_id: "
+            f"{json.dumps(rejected_job)}"
+        )
+    if rejected_job.get("status") != "pending_approval":
+        fail("create rejection-gated job: status was not pending_approval")
+
+    rejection_payload = {
+        "decided_by": "atlas-automation-smoke",
+        "decision_reason": "Synthetic local smoke rejection validation.",
+    }
+    status_code, rejected_gate = request(
+        "POST",
+        f"/approval-gates/{rejected_gate_id}/reject",
+        rejection_payload,
+    )
+    expect(status_code, 200, "reject linked approval gate", rejected_gate)
+
+    if rejected_gate.get("status") != "rejected":
+        fail("reject linked approval gate: gate status was not rejected")
+    if rejected_gate.get("job_id") != rejected_job_id:
+        fail("reject linked approval gate: linked job ID did not match")
+    if rejected_gate.get("job_status") != "rejected":
+        fail("reject linked approval gate: linked job status was not rejected")
+    if rejected_gate.get("job_event_type") != "jobs.rejected":
+        fail("reject linked approval gate: linked job event type did not match")
+
+    status_code, fetched_rejected_job = request("GET", f"/jobs/{rejected_job_id}")
+    expect(status_code, 200, "get rejected job", fetched_rejected_job)
+    if fetched_rejected_job.get("status") != "rejected":
+        fail("get rejected job: status was not rejected")
+    if fetched_rejected_job.get("approval_gate_id") != rejected_gate_id:
+        fail("get rejected job: approval gate ID did not match")
+
+    status_code, blocked_rejected_execution = request(
+        "POST",
+        f"/jobs/{rejected_job_id}/execute",
+    )
+    expect(
+        status_code,
+        409,
+        "block execution of rejected job",
+        blocked_rejected_execution,
+    )
+    if blocked_rejected_execution.get("detail") != "job is not queued":
+        fail(
+            "block execution of rejected job: unexpected error detail: "
+            f"{json.dumps(blocked_rejected_execution)}"
+        )
+
     print(f"PASS  correlation integrity: {correlation_id}")
     print(f"PASS  synthetic workflow ID: {run_id}")
     print("RESULT: SMOKE TEST PASSED")
