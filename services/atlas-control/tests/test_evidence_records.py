@@ -11,6 +11,7 @@ import sys
 APP_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_ROOT))
 
+from app.auth import DEFAULT_TENANT_ID
 from app.main import app
 
 
@@ -87,7 +88,11 @@ async def test_get_evidence_record_returns_serialized_record(install_pool):
     connection, pool = install_pool(row=row)
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer dev-requester"},
+    ) as client:
         response = await client.get(f"/evidence-records/{EVIDENCE_ID}")
 
     assert response.status_code == 200
@@ -109,7 +114,8 @@ async def test_get_evidence_record_returns_serialized_record(install_pool):
     assert method == "fetchrow"
     assert "FROM evidence_records" in query
     assert "WHERE evidence_id = $1" in query
-    assert args == (EVIDENCE_ID,)
+    assert "AND tenant_id = $2" in query
+    assert args == (EVIDENCE_ID, DEFAULT_TENANT_ID)
 
 
 @pytest.mark.asyncio
@@ -117,7 +123,11 @@ async def test_get_evidence_record_returns_404_when_missing(install_pool):
     connection, pool = install_pool(row=None)
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer dev-requester"},
+    ) as client:
         response = await client.get(f"/evidence-records/{EVIDENCE_ID}")
 
     assert response.status_code == 404
@@ -131,7 +141,11 @@ async def test_get_evidence_record_rejects_invalid_uuid(install_pool):
     connection, pool = install_pool()
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer dev-requester"},
+    ) as client:
         response = await client.get("/evidence-records/not-a-uuid")
 
     assert response.status_code == 422
@@ -144,7 +158,11 @@ async def test_get_evidence_record_returns_503_for_database_failure(install_pool
     connection, pool = install_pool(error=RuntimeError("database unavailable"))
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer dev-requester"},
+    ) as client:
         response = await client.get(f"/evidence-records/{EVIDENCE_ID}")
 
     assert response.status_code == 503
@@ -166,7 +184,11 @@ async def test_list_intake_evidence_records_returns_serialized_records(install_p
     )
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer dev-requester"},
+    ) as client:
         response = await client.get(
             f"/intake-items/{INTAKE_ID}/evidence-records?limit=2&offset=1"
         )
@@ -210,15 +232,17 @@ async def test_list_intake_evidence_records_returns_serialized_records(install_p
     assert intake_method == "fetchrow"
     assert "FROM intake_items" in intake_query
     assert "WHERE intake_id = $1" in intake_query
-    assert intake_args == (INTAKE_ID,)
+    assert "AND tenant_id = $2" in intake_query
+    assert intake_args == (INTAKE_ID, DEFAULT_TENANT_ID)
 
     list_method, list_query, list_args = connection.calls[1]
     assert list_method == "fetch"
     assert "FROM evidence_records" in list_query
     assert "WHERE intake_id = $1" in list_query
+    assert "AND tenant_id = $2" in list_query
     assert "ORDER BY created_at DESC, evidence_id DESC" in list_query
-    assert "LIMIT $2 OFFSET $3" in list_query
-    assert list_args == (INTAKE_ID, 2, 1)
+    assert "LIMIT $3 OFFSET $4" in list_query
+    assert list_args == (INTAKE_ID, DEFAULT_TENANT_ID, 2, 1)
 
 
 @pytest.mark.asyncio
@@ -226,7 +250,11 @@ async def test_list_intake_evidence_records_returns_empty_items(install_pool):
     connection, pool = install_pool(row={"intake_id": INTAKE_ID}, rows=[])
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer dev-requester"},
+    ) as client:
         response = await client.get(f"/intake-items/{INTAKE_ID}/evidence-records")
 
     assert response.status_code == 200
@@ -245,7 +273,11 @@ async def test_list_intake_evidence_records_returns_404_when_intake_missing(inst
     connection, pool = install_pool(row=None)
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer dev-requester"},
+    ) as client:
         response = await client.get(
             f"/intake-items/{MISSING_INTAKE_ID}/evidence-records"
         )
@@ -271,7 +303,11 @@ async def test_list_intake_evidence_records_rejects_invalid_parameters(install_p
     connection, pool = install_pool()
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer dev-requester"},
+    ) as client:
         response = await client.get(path)
 
     assert response.status_code == 422
@@ -284,10 +320,34 @@ async def test_list_intake_evidence_records_returns_503_for_database_failure(ins
     connection, pool = install_pool(error=RuntimeError("database unavailable"))
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer dev-requester"},
+    ) as client:
         response = await client.get(f"/intake-items/{INTAKE_ID}/evidence-records")
 
     assert response.status_code == 503
     assert response.json() == {"detail": "database query failed"}
     assert pool.acquire_count == 1
     assert len(connection.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_evidence_lookup_denies_principal_without_research_permission(
+    install_pool,
+):
+    connection, pool = install_pool()
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"Authorization": "Bearer dev-approver"},
+    ) as client:
+        response = await client.get(f"/evidence-records/{EVIDENCE_ID}")
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "permission denied"}
+    assert connection.calls == []
+    assert pool.acquire_count == 0
