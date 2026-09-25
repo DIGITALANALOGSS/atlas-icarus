@@ -248,6 +248,114 @@ async def test_execute_queued_job_completes_and_writes_events(install_pool):
 
 
 @pytest.mark.asyncio
+async def test_execute_running_job_returns_conflict_without_duplicate_writes(
+    install_pool,
+):
+    running = executable_job_row(
+        "running",
+        started_at=datetime(2026, 9, 25, 12, 1, 0, tzinfo=timezone.utc),
+    )
+    connection, pool = install_pool(rows=[None, running])
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/jobs/{JOB_ID}/execute",
+            headers=WORKER_HEADERS,
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "job is already running"}
+    assert pool.acquire_count == 1
+    assert connection.calls[0] == ("transaction", None, ())
+    assert len(connection.calls) == 3
+
+    queued_update = connection.calls[1]
+    assert queued_update[0] == "fetchrow"
+    assert "UPDATE jobs" in queued_update[1]
+    assert "AND tenant_id = $2" in queued_update[1]
+    assert "AND status = 'queued'" in queued_update[1]
+    assert queued_update[2][0] == JOB_ID
+    assert queued_update[2][1] == DEFAULT_TENANT_ID
+
+    existing_lookup = connection.calls[2]
+    assert existing_lookup[0] == "fetchrow"
+    assert "FROM jobs" in existing_lookup[1]
+    assert "WHERE job_id = $1 AND tenant_id = $2" in existing_lookup[1]
+    assert existing_lookup[2] == (JOB_ID, DEFAULT_TENANT_ID)
+
+    assert not any(call[0] == "execute" for call in connection.calls)
+
+
+@pytest.mark.asyncio
+async def test_execute_succeeded_job_returns_stored_result_without_duplicate_writes(
+    install_pool,
+):
+    completed_at = datetime(2026, 9, 25, 12, 2, 0, tzinfo=timezone.utc)
+    succeeded = executable_job_row(
+        "succeeded",
+        started_at=datetime(2026, 9, 25, 12, 1, 0, tzinfo=timezone.utc),
+        completed_at=completed_at,
+        result_payload={
+            "char_count": len("tenant isolation execution"),
+            "word_count": 3,
+            "sha256": "98d506d5e949f90c4c637819e4aa144499a97e89d6d0c74ba510839fd1c65a52",
+            "analyzed_at": "2026-09-25T12:02:00Z",
+        },
+    )
+    connection, pool = install_pool(rows=[None, succeeded])
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/jobs/{JOB_ID}/execute",
+            headers=WORKER_HEADERS,
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "job_id": str(JOB_ID),
+        "job_type": "research.summarize",
+        "request_payload": {"content": "tenant isolation execution"},
+        "status": "succeeded",
+        "approval_required": False,
+        "approval_gate_id": None,
+        "correlation_id": str(CORRELATION_ID),
+        "result_payload": {
+            "char_count": len("tenant isolation execution"),
+            "word_count": 3,
+            "sha256": "98d506d5e949f90c4c637819e4aa144499a97e89d6d0c74ba510839fd1c65a52",
+            "analyzed_at": "2026-09-25T12:02:00Z",
+        },
+        "error_code": None,
+        "created_at": "2026-09-25T12:00:00Z",
+        "started_at": "2026-09-25T12:01:00Z",
+        "completed_at": "2026-09-25T12:02:00Z",
+    }
+    assert pool.acquire_count == 1
+    assert connection.calls[0] == ("transaction", None, ())
+    assert len(connection.calls) == 3
+
+    queued_update = connection.calls[1]
+    assert queued_update[0] == "fetchrow"
+    assert "UPDATE jobs" in queued_update[1]
+    assert "AND tenant_id = $2" in queued_update[1]
+    assert "AND status = 'queued'" in queued_update[1]
+    assert queued_update[2][0] == JOB_ID
+    assert queued_update[2][1] == DEFAULT_TENANT_ID
+
+    existing_lookup = connection.calls[2]
+    assert existing_lookup[0] == "fetchrow"
+    assert "SELECT" in existing_lookup[1]
+    assert "result_payload" in existing_lookup[1]
+    assert "FROM jobs" in existing_lookup[1]
+    assert "WHERE job_id = $1 AND tenant_id = $2" in existing_lookup[1]
+    assert existing_lookup[2] == (JOB_ID, DEFAULT_TENANT_ID)
+
+    assert not any(call[0] == "execute" for call in connection.calls)
+
+
+@pytest.mark.asyncio
 async def test_execute_job_returns_404_without_writes_when_not_visible_to_tenant(
     install_pool,
 ):
@@ -277,7 +385,8 @@ async def test_execute_job_returns_404_without_writes_when_not_visible_to_tenant
 
     visibility_lookup = connection.calls[2]
     assert visibility_lookup[0] == "fetchrow"
-    assert "SELECT status" in visibility_lookup[1]
+    assert "SELECT" in visibility_lookup[1]
+    assert "status" in visibility_lookup[1]
     assert "WHERE job_id = $1 AND tenant_id = $2" in visibility_lookup[1]
     assert visibility_lookup[2] == (MISSING_JOB_ID, DEFAULT_TENANT_ID)
 

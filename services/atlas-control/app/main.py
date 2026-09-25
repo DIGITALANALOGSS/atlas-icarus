@@ -1222,7 +1222,10 @@ async def execute_job(
                 if row is None:
                     existing = await connection.fetchrow(
                         """
-                        SELECT status
+                        SELECT
+                          job_id, job_type, request_payload, status,
+                          approval_required, approval_gate_id, correlation_id,
+                          result_payload, error_code, created_at, started_at, completed_at
                         FROM jobs
                         WHERE job_id = $1 AND tenant_id = $2
                         """,
@@ -1234,10 +1237,17 @@ async def execute_job(
                             status_code=status.HTTP_404_NOT_FOUND,
                             detail="job not found",
                         )
+                    if existing["status"] == "succeeded":
+                        return serialize_job(existing)
                     if existing["status"] == "pending_approval":
                         raise HTTPException(
                             status_code=status.HTTP_409_CONFLICT,
                             detail="job is awaiting approval",
+                        )
+                    if existing["status"] == "running":
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="job is already running",
                         )
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
