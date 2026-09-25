@@ -173,8 +173,8 @@ async def test_create_approval_gate_persists_pending_gate_and_event(install_pool
     assert execute_calls[0][2][7] == CORRELATION_ID
     assert execute_calls[0][2][8] == DEFAULT_TENANT_ID
     assert "INSERT INTO events" in execute_calls[1][1]
-    assert execute_calls[1][2][1] == "governance.approval_gate.created"
-    assert execute_calls[1][2][4] == CORRELATION_ID
+    assert execute_calls[1][2][2] == "governance.approval_gate.created"
+    assert execute_calls[1][2][5] == CORRELATION_ID
 
 
 @pytest.mark.asyncio
@@ -355,8 +355,8 @@ async def test_approve_pending_gate_queues_linked_job_and_writes_events(install_
     approval_event = connection.calls[2]
     assert approval_event[0] == "execute"
     assert "INSERT INTO events" in approval_event[1]
-    assert approval_event[2][1] == "governance.approval_gate.approved"
-    assert approval_event[2][4] == CORRELATION_ID
+    assert approval_event[2][2] == "governance.approval_gate.approved"
+    assert approval_event[2][5] == CORRELATION_ID
 
     job_update = connection.calls[3]
     assert job_update[0] == "fetchrow"
@@ -369,8 +369,8 @@ async def test_approve_pending_gate_queues_linked_job_and_writes_events(install_
     job_event = connection.calls[4]
     assert job_event[0] == "execute"
     assert "INSERT INTO events" in job_event[1]
-    assert job_event[2][1] == "jobs.queued"
-    assert job_event[2][4] == CORRELATION_ID
+    assert job_event[2][2] == "jobs.queued"
+    assert job_event[2][5] == CORRELATION_ID
 
 
 @pytest.mark.asyncio
@@ -415,8 +415,8 @@ async def test_reject_pending_gate_rejects_linked_job_and_writes_events(install_
     approval_event = connection.calls[2]
     assert approval_event[0] == "execute"
     assert "INSERT INTO events" in approval_event[1]
-    assert approval_event[2][1] == "governance.approval_gate.rejected"
-    assert approval_event[2][4] == CORRELATION_ID
+    assert approval_event[2][2] == "governance.approval_gate.rejected"
+    assert approval_event[2][5] == CORRELATION_ID
 
     job_update = connection.calls[3]
     assert job_update[0] == "fetchrow"
@@ -433,8 +433,8 @@ async def test_reject_pending_gate_rejects_linked_job_and_writes_events(install_
     job_event = connection.calls[4]
     assert job_event[0] == "execute"
     assert "INSERT INTO events" in job_event[1]
-    assert job_event[2][1] == "jobs.rejected"
-    assert job_event[2][4] == CORRELATION_ID
+    assert job_event[2][2] == "jobs.rejected"
+    assert job_event[2][5] == CORRELATION_ID
 
 
 @pytest.mark.asyncio
