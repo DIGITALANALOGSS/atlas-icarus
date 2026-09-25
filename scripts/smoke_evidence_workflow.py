@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 BASE_URL = "http://127.0.0.1:8000"
+SMOKE_TOKEN = "dev-admin"
 
 
 def fail(message: str) -> None:
@@ -20,9 +21,16 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
-def request(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
+def request(
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    authenticated: bool = True,
+) -> tuple[int, dict]:
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json"} if data else {}
+    if authenticated:
+        headers["Authorization"] = f"Bearer {SMOKE_TOKEN}"
     request_object = Request(
         f"{BASE_URL}{path}",
         data=data,
@@ -48,7 +56,7 @@ def wait_for_ready(timeout_seconds: int = 60) -> dict:
 
     while time.monotonic() < deadline:
         try:
-            status_code, body = request("GET", "/readyz")
+            status_code, body = request("GET", "/readyz", authenticated=False)
             if status_code == 200 and body.get("database") == "reachable":
                 return body
             last_error = f"HTTP {status_code}: {body}"
@@ -244,6 +252,50 @@ def main() -> None:
         fail("get approved approval gate: correlation ID did not match")
     if fetched_approved_gate.get("decision_event_id") != approved_gate.get("event_id"):
         fail("get approved approval gate: decision event ID did not match")
+
+    job_content = f"Synthetic job execution smoke validation {run_id}"
+    job_payload = {
+        "job_type": "metadata.analyze",
+        "request_payload": {"content": job_content},
+        "approval_required": False,
+        "correlation_id": correlation_id,
+    }
+    status_code, created_job = request("POST", "/jobs", job_payload)
+    expect(status_code, 201, "create executable job", created_job)
+
+    job_id = created_job.get("job_id")
+    if not job_id:
+        fail(f"create executable job: missing job_id: {json.dumps(created_job)}")
+    if created_job.get("status") != "queued":
+        fail("create executable job: status was not queued")
+    if created_job.get("correlation_id") != correlation_id:
+        fail("create executable job: correlation ID did not match")
+
+    status_code, completed_job = request("POST", f"/jobs/{job_id}/execute")
+    expect(status_code, 200, "execute queued job", completed_job)
+    if completed_job.get("status") != "succeeded":
+        fail("execute queued job: status was not succeeded")
+
+    result_payload = completed_job.get("result_payload")
+    if not isinstance(result_payload, dict):
+        fail("execute queued job: missing result payload")
+    if result_payload.get("char_count") != len(job_content):
+        fail("execute queued job: character count did not match")
+    if result_payload.get("word_count") != len(job_content.split()):
+        fail("execute queued job: word count did not match")
+    expected_sha256 = hashlib.sha256(job_content.encode("utf-8")).hexdigest()
+    if result_payload.get("sha256") != expected_sha256:
+        fail("execute queued job: SHA-256 did not match")
+
+    status_code, retried_job = request("POST", f"/jobs/{job_id}/execute")
+    expect(status_code, 200, "retry succeeded job", retried_job)
+    if retried_job != completed_job:
+        fail("retry succeeded job: stored result did not match original response")
+
+    status_code, fetched_job = request("GET", f"/jobs/{job_id}")
+    expect(status_code, 200, "get succeeded job", fetched_job)
+    if fetched_job != completed_job:
+        fail("get succeeded job: stored result did not match original response")
 
     print(f"PASS  correlation integrity: {correlation_id}")
     print(f"PASS  synthetic workflow ID: {run_id}")
