@@ -21,6 +21,7 @@ class IdentityProvider(Protocol):
 
 
 DEFAULT_TENANT_ID = UUID("11111111-1111-1111-1111-111111111111")
+CROSS_TENANT_ID = UUID("22222222-2222-2222-2222-222222222222")
 
 
 @lru_cache(maxsize=1)
@@ -67,6 +68,19 @@ def development_principals() -> dict[str, Principal]:
                 }
             ),
             principal_type="service",
+        ),
+        "dev-cross-tenant-operator": Principal(
+            subject_id="atlas-cross-tenant-operator",
+            tenant_id=CROSS_TENANT_ID,
+            permissions=frozenset(
+                {
+                    "approval-gates:read",
+                    "approval-gates:decide",
+                    "jobs:read",
+                    "jobs:execute",
+                }
+            ),
+            principal_type="user",
         ),
         "dev-admin": Principal(
             subject_id=os.getenv("ATLAS_DEV_ADMIN_ID", "atlas-admin"),

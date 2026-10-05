@@ -14,6 +14,7 @@ from uuid import uuid4
 
 BASE_URL = "http://127.0.0.1:8000"
 SMOKE_TOKEN = "dev-admin"
+CROSS_TENANT_TOKEN = "dev-cross-tenant-operator"
 
 
 def fail(message: str) -> None:
@@ -26,11 +27,12 @@ def request(
     path: str,
     payload: dict | None = None,
     authenticated: bool = True,
+    token: str = SMOKE_TOKEN,
 ) -> tuple[int, dict]:
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json"} if data else {}
     if authenticated:
-        headers["Authorization"] = f"Bearer {SMOKE_TOKEN}"
+        headers["Authorization"] = f"Bearer {token}"
     request_object = Request(
         f"{BASE_URL}{path}",
         data=data,
@@ -429,6 +431,107 @@ def main() -> None:
             "block execution of rejected job: unexpected error detail: "
             f"{json.dumps(blocked_rejected_execution)}"
         )
+
+    isolation_content = f"Synthetic cross-tenant isolation smoke validation {run_id}"
+    isolation_job_payload = {
+        "job_type": "metadata.analyze",
+        "request_payload": {"content": isolation_content},
+        "approval_required": True,
+        "correlation_id": correlation_id,
+    }
+    status_code, isolation_job = request("POST", "/jobs", isolation_job_payload)
+    expect(status_code, 201, "create cross-tenant isolation job", isolation_job)
+
+    isolation_job_id = isolation_job.get("job_id")
+    isolation_gate_id = isolation_job.get("approval_gate_id")
+    if not isolation_job_id or not isolation_gate_id:
+        fail(
+            "create cross-tenant isolation job: missing job_id or approval_gate_id: "
+            f"{json.dumps(isolation_job)}"
+        )
+    if isolation_job.get("status") != "pending_approval":
+        fail("create cross-tenant isolation job: status was not pending_approval")
+
+    status_code, cross_tenant_job = request(
+        "GET",
+        f"/jobs/{isolation_job_id}",
+        token=CROSS_TENANT_TOKEN,
+    )
+    expect(status_code, 404, "block cross-tenant job read", cross_tenant_job)
+    if cross_tenant_job.get("detail") != "job not found":
+        fail(
+            "block cross-tenant job read: unexpected error detail: "
+            f"{json.dumps(cross_tenant_job)}"
+        )
+
+    status_code, cross_tenant_execution = request(
+        "POST",
+        f"/jobs/{isolation_job_id}/execute",
+        token=CROSS_TENANT_TOKEN,
+    )
+    expect(
+        status_code,
+        404,
+        "block cross-tenant job execution",
+        cross_tenant_execution,
+    )
+    if cross_tenant_execution.get("detail") != "job not found":
+        fail(
+            "block cross-tenant job execution: unexpected error detail: "
+            f"{json.dumps(cross_tenant_execution)}"
+        )
+
+    cross_tenant_decision = {
+        "decided_by": "atlas-cross-tenant-operator",
+        "decision_reason": "Synthetic tenant-isolation validation.",
+    }
+    status_code, cross_tenant_gate_decision = request(
+        "POST",
+        f"/approval-gates/{isolation_gate_id}/approve",
+        cross_tenant_decision,
+        token=CROSS_TENANT_TOKEN,
+    )
+    expect(
+        status_code,
+        404,
+        "block cross-tenant approval decision",
+        cross_tenant_gate_decision,
+    )
+    if cross_tenant_gate_decision.get("detail") != "approval gate not found":
+        fail(
+            "block cross-tenant approval decision: unexpected error detail: "
+            f"{json.dumps(cross_tenant_gate_decision)}"
+        )
+
+    status_code, source_tenant_job = request("GET", f"/jobs/{isolation_job_id}")
+    expect(status_code, 200, "get source-tenant isolation job", source_tenant_job)
+    if source_tenant_job.get("status") != "pending_approval":
+        fail("get source-tenant isolation job: status changed unexpectedly")
+
+    status_code, source_tenant_gate = request(
+        "GET",
+        f"/approval-gates/{isolation_gate_id}",
+    )
+    expect(status_code, 200, "get source-tenant isolation gate", source_tenant_gate)
+    if source_tenant_gate.get("status") != "pending":
+        fail("get source-tenant isolation gate: status changed unexpectedly")
+
+    isolation_cleanup = {
+        "decided_by": "atlas-automation-smoke",
+        "decision_reason": "Synthetic tenant-isolation smoke cleanup.",
+    }
+    status_code, cleaned_isolation_gate = request(
+        "POST",
+        f"/approval-gates/{isolation_gate_id}/reject",
+        isolation_cleanup,
+    )
+    expect(status_code, 200, "reject source-tenant isolation gate", cleaned_isolation_gate)
+    if cleaned_isolation_gate.get("status") != "rejected":
+        fail("reject source-tenant isolation gate: status was not rejected")
+    if cleaned_isolation_gate.get("job_id") != isolation_job_id:
+        fail("reject source-tenant isolation gate: linked job ID did not match")
+    if cleaned_isolation_gate.get("job_status") != "rejected":
+        fail("reject source-tenant isolation gate: linked job status was not rejected")
 
     print(f"PASS  correlation integrity: {correlation_id}")
     print(f"PASS  synthetic workflow ID: {run_id}")

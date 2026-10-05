@@ -10,6 +10,7 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_ROOT))
 
 from app.auth import (
+    CROSS_TENANT_ID,
     DEFAULT_TENANT_ID,
     Principal,
     development_principals,
@@ -184,6 +185,25 @@ async def test_approver_cannot_execute():
 
     assert response.status_code == 403
     assert response.json() == {"detail": "permission denied"}
+
+
+@pytest.mark.asyncio
+async def test_cross_tenant_operator_has_distinct_tenant_and_required_permissions():
+    principal = await get_principal("Bearer dev-cross-tenant-operator")
+
+    assert principal == Principal(
+        subject_id="atlas-cross-tenant-operator",
+        tenant_id=CROSS_TENANT_ID,
+        permissions=frozenset(
+            {
+                "approval-gates:read",
+                "approval-gates:decide",
+                "jobs:read",
+                "jobs:execute",
+            }
+        ),
+        principal_type="user",
+    )
 
 
 @pytest.mark.asyncio
