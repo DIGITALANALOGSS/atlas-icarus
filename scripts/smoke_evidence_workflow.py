@@ -177,6 +177,88 @@ def main() -> None:
             f"{sorted(expected_event_types - event_types)}"
         )
 
+    status_code, cross_tenant_evidence = request(
+        "GET",
+        f"/evidence-records/{evidence_id}",
+        token=CROSS_TENANT_TOKEN,
+    )
+    expect(
+        status_code,
+        404,
+        "block cross-tenant evidence read",
+        cross_tenant_evidence,
+    )
+    if cross_tenant_evidence.get("detail") != "evidence record not found":
+        fail(
+            "block cross-tenant evidence read: unexpected error detail: "
+            f"{json.dumps(cross_tenant_evidence)}"
+        )
+
+    status_code, cross_tenant_evidence_list = request(
+        "GET",
+        f"/intake-items/{intake_id}/evidence-records?limit=10&offset=0",
+        token=CROSS_TENANT_TOKEN,
+    )
+    expect(
+        status_code,
+        404,
+        "block cross-tenant evidence list",
+        cross_tenant_evidence_list,
+    )
+    if cross_tenant_evidence_list.get("detail") != "intake item not found":
+        fail(
+            "block cross-tenant evidence list: unexpected error detail: "
+            f"{json.dumps(cross_tenant_evidence_list)}"
+        )
+
+    status_code, cross_tenant_events = request(
+        "GET",
+        f"/intake-items/{intake_id}/events",
+        token=CROSS_TENANT_TOKEN,
+    )
+    expect(
+        status_code,
+        404,
+        "block cross-tenant intake events",
+        cross_tenant_events,
+    )
+    if cross_tenant_events.get("detail") != "intake item not found":
+        fail(
+            "block cross-tenant intake events: unexpected error detail: "
+            f"{json.dumps(cross_tenant_events)}"
+        )
+
+    status_code, cross_tenant_evidence_create = request(
+        "POST",
+        f"/intake-items/{intake_id}/evidence-records",
+        evidence_payload,
+        token=CROSS_TENANT_TOKEN,
+    )
+    expect(
+        status_code,
+        404,
+        "block cross-tenant evidence create",
+        cross_tenant_evidence_create,
+    )
+    if cross_tenant_evidence_create.get("detail") != "intake item not found":
+        fail(
+            "block cross-tenant evidence create: unexpected error detail: "
+            f"{json.dumps(cross_tenant_evidence_create)}"
+        )
+
+    status_code, source_tenant_evidence = request(
+        "GET",
+        f"/evidence-records/{evidence_id}",
+    )
+    expect(
+        status_code,
+        200,
+        "get source-tenant isolation evidence",
+        source_tenant_evidence,
+    )
+    if source_tenant_evidence.get("sha256") != evidence_sha256:
+        fail("get source-tenant isolation evidence: SHA-256 changed unexpectedly")
+
     approval_payload = {
         "requester": "atlas-automation-smoke",
         "action_type": "engineering.patch.apply",

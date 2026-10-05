@@ -78,6 +78,9 @@ def development_principals() -> dict[str, Principal]:
                     "approval-gates:decide",
                     "jobs:read",
                     "jobs:execute",
+                    "research:intake:read",
+                    "research:evidence:create",
+                    "research:evidence:read",
                 }
             ),
             principal_type="user",

@@ -200,6 +200,9 @@ async def test_cross_tenant_operator_has_distinct_tenant_and_required_permission
                 "approval-gates:decide",
                 "jobs:read",
                 "jobs:execute",
+                "research:intake:read",
+                "research:evidence:create",
+                "research:evidence:read",
             }
         ),
         principal_type="user",
