@@ -1,3 +1,5 @@
+from app.workflow_adapters import actor_id_for_subject, execute_text_analysis
+from app.workflows import WorkflowNodeRequest
 import asyncio
 import hashlib
 import json
@@ -1192,13 +1194,6 @@ async def get_job(
     return serialize_job(row)
 
 
-def analyze_text(content: str, *, analyzed_at: str) -> dict:
-    return {
-        "char_count": len(content),
-        "word_count": len(content.split()),
-        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        "analyzed_at": analyzed_at,
-    }
 
 
 @app.post("/jobs/{job_id}/execute")
@@ -1278,10 +1273,25 @@ async def execute_job(
                 request_payload = decode_json_object(row["request_payload"])
                 content = request_payload["content"]
                 completed_at = datetime.now(timezone.utc)
-                result_payload = analyze_text(
-                    content,
+                # Local convention: one job is one workflow with one node.
+                node_request = WorkflowNodeRequest(
+                    node_id=row["job_id"],
+                    workflow_id=row["job_id"],
+                    correlation_id=row["correlation_id"],
+                    tenant_id=principal.tenant_id,
+                    actor_id=actor_id_for_subject(
+                        principal.tenant_id, principal.subject_id
+                    ),
+                    node_type="metadata.analyze",
+                    input={"content": content},
+                    created_at=started_at,
+                )
+                node_result = execute_text_analysis(
+                    node_request,
+                    completed_at=completed_at,
                     analyzed_at=serialize_datetime(completed_at),
                 )
+                result_payload = node_result.output
 
                 completed = await connection.fetchrow(
                     """
