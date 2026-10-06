@@ -1192,6 +1192,15 @@ async def get_job(
     return serialize_job(row)
 
 
+def analyze_text(content: str, *, analyzed_at: str) -> dict:
+    return {
+        "char_count": len(content),
+        "word_count": len(content.split()),
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "analyzed_at": analyzed_at,
+    }
+
+
 @app.post("/jobs/{job_id}/execute")
 async def execute_job(
     job_id: UUID,
@@ -1269,12 +1278,10 @@ async def execute_job(
                 request_payload = decode_json_object(row["request_payload"])
                 content = request_payload["content"]
                 completed_at = datetime.now(timezone.utc)
-                result_payload = {
-                    "char_count": len(content),
-                    "word_count": len(content.split()),
-                    "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                    "analyzed_at": serialize_datetime(completed_at),
-                }
+                result_payload = analyze_text(
+                    content,
+                    analyzed_at=serialize_datetime(completed_at),
+                )
 
                 completed = await connection.fetchrow(
                     """
