@@ -1,5 +1,5 @@
 from app.workflow_adapters import actor_id_for_subject, execute_text_analysis
-from app.workflows import WorkflowNodeRequest
+from app.workflows import WorkflowError, WorkflowNodeRequest, WorkflowNodeResult, WorkflowStatus
 import asyncio
 import hashlib
 import json
@@ -1298,6 +1298,19 @@ async def execute_job(
                     # Database and audit failures still reach the outer exception handler.
                     failed_at = datetime.now(timezone.utc)
                     error_code = "analysis_execution_failed"
+                    failure_result = WorkflowNodeResult(
+                        node_id=row["job_id"],
+                        workflow_id=row["job_id"],
+                        correlation_id=row["correlation_id"],
+                        tenant_id=principal.tenant_id,
+                        status=WorkflowStatus.FAILED,
+                        error=WorkflowError(
+                            code=error_code,
+                            message="Text analysis could not be completed.",
+                            retryable=False,
+                        ),
+                        completed_at=failed_at,
+                    )
                     failed = await connection.fetchrow(
                         """
                         UPDATE jobs
@@ -1305,7 +1318,8 @@ async def execute_job(
                           status = 'failed',
                           result_payload = NULL,
                           error_code = $3,
-                          completed_at = $4
+                          completed_at = $4,
+                      workflow_result = $5::jsonb
                         WHERE job_id = $1
                           AND tenant_id = $2
                           AND status = 'running'
@@ -1317,7 +1331,7 @@ async def execute_job(
                         job_id,
                         principal.tenant_id,
                         error_code,
-                        failed_at,
+                        failed_at, failure_result.model_dump_json(),
                     )
                     if failed is None:
                         raise HTTPException(
@@ -1344,7 +1358,8 @@ async def execute_job(
                     SET
                       status = 'succeeded',
                       result_payload = $3::jsonb,
-                      completed_at = $4
+                      completed_at = $4,
+                      workflow_result = $5::jsonb
                     WHERE job_id = $1
                       AND tenant_id = $2
                       AND status = 'running'
@@ -1356,7 +1371,7 @@ async def execute_job(
                     job_id,
                     principal.tenant_id,
                     json.dumps(result_payload),
-                    completed_at,
+                    completed_at, node_result.model_dump_json(),
                 )
 
                 if completed is None:

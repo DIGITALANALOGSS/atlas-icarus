@@ -1,6 +1,7 @@
+import json
 import os
 from urllib.parse import urlparse
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -8,12 +9,16 @@ import pytest
 from app import main as main_module
 from app.auth import DEFAULT_TENANT_ID
 from app.main import app
+from app.workflows import WorkflowNodeResult, WorkflowStatus
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reject_failure_event", [False, True])
+@pytest.mark.parametrize(
+    "adapter_failure,reject_failure_event",
+    [(False, False), (True, False), (True, True)],
+)
 async def test_execution_failure_commit_or_rollback(
-    monkeypatch, reject_failure_event
+    monkeypatch, adapter_failure, reject_failure_event
 ):
     database = urlparse(os.environ.get("DATABASE_URL", ""))
     if (
@@ -59,7 +64,8 @@ async def test_execution_failure_commit_or_rollback(
                     before = await connection.fetchrow(
                         """
                         SELECT status, started_at, completed_at,
-                               result_payload, error_code
+                               result_payload, error_code,
+                               workflow_result
                         FROM jobs
                         WHERE job_id = $1::uuid AND tenant_id = $2
                         """,
@@ -68,6 +74,7 @@ async def test_execution_failure_commit_or_rollback(
                     )
                     assert before is not None
                     assert before["status"] == "queued"
+                    assert before["workflow_result"] is None
                     before_events = await connection.fetchval(
                         """
                         SELECT count(*) FROM events
@@ -103,9 +110,10 @@ async def test_execution_failure_commit_or_rollback(
                         )
                         trigger_created = True
 
-                monkeypatch.setattr(
-                    main_module, "execute_text_analysis", broken_adapter
-                )
+                if adapter_failure:
+                    monkeypatch.setattr(
+                        main_module, "execute_text_analysis", broken_adapter
+                    )
                 response = await client.post(
                     f"/jobs/{job_id}/execute", headers=headers
                 )
@@ -114,7 +122,8 @@ async def test_execution_failure_commit_or_rollback(
                     after = await connection.fetchrow(
                         """
                         SELECT status, started_at, completed_at,
-                               result_payload, error_code
+                               result_payload, error_code,
+                               workflow_result
                         FROM jobs
                         WHERE job_id = $1::uuid AND tenant_id = $2
                         """,
@@ -152,16 +161,45 @@ async def test_execution_failure_commit_or_rollback(
                     assert execution_events == []
                 else:
                     assert response.status_code == 200, response.text
-                    assert response.json()["status"] == "failed"
-                    assert after["status"] == "failed"
-                    assert after["error_code"] == "analysis_execution_failed"
-                    assert after["result_payload"] is None
+                    body = response.json()
+                    expected = "failed" if adapter_failure else "succeeded"
+                    assert body["status"] == expected
+                    assert after["status"] == expected
                     assert after["started_at"] is not None
                     assert after["completed_at"] is not None
                     assert after_events == before_events + 2
                     assert sorted(
                         row["event_type"] for row in execution_events
-                    ) == ["jobs.failed", "jobs.started"]
+                    ) == sorted(["jobs.started", f"jobs.{expected}"])
+                    assert "workflow_result" not in body
+
+                    raw = after["workflow_result"]
+                    assert raw is not None
+                    data = json.loads(raw) if isinstance(raw, str) else raw
+                    envelope = WorkflowNodeResult.model_validate(data)
+                    assert envelope.node_id == UUID(job_id)
+                    assert envelope.workflow_id == UUID(job_id)
+                    assert envelope.tenant_id == DEFAULT_TENANT_ID
+                    assert envelope.correlation_id == correlation_id
+                    assert envelope.completed_at == after["completed_at"]
+                    assert "private integration adapter detail" not in str(raw)
+
+                    if adapter_failure:
+                        assert envelope.status == WorkflowStatus.FAILED
+                        assert envelope.error is not None
+                        assert envelope.error.code == "analysis_execution_failed"
+                        assert envelope.output == {}
+                        assert after["error_code"] == envelope.error.code
+                        assert after["result_payload"] is None
+                    else:
+                        assert envelope.status == WorkflowStatus.SUCCEEDED
+                        assert envelope.error is None
+                        assert after["error_code"] is None
+                        stored_output = after["result_payload"]
+                        if isinstance(stored_output, str):
+                            stored_output = json.loads(stored_output)
+                        assert envelope.output == stored_output
+                        assert envelope.output == body["result_payload"]
         finally:
             async with pool.acquire() as connection:
                 if trigger_created:

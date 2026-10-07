@@ -231,6 +231,14 @@ async def test_execute_queued_job_completes_and_writes_events(install_pool):
     assert completion_update[2][0] == JOB_ID
     assert completion_update[2][1] == DEFAULT_TENANT_ID
     result_payload = json.loads(completion_update[2][2])
+    envelope = json.loads(completion_update[2][4])
+    assert envelope["status"] == "succeeded"
+    assert envelope["node_id"] == str(JOB_ID)
+    assert envelope["workflow_id"] == str(JOB_ID)
+    assert envelope["tenant_id"] == str(DEFAULT_TENANT_ID)
+    assert envelope["correlation_id"] == str(CORRELATION_ID)
+    assert envelope["output"] == result_payload
+    assert "workflow_result" not in body
     assert result_payload["char_count"] == len("tenant isolation execution")
     assert result_payload["word_count"] == 3
     assert (
@@ -441,6 +449,14 @@ async def test_adapter_failure_records_failed_job(
         JOB_ID, DEFAULT_TENANT_ID, "analysis_execution_failed"
     )
     assert update[2][3].tzinfo is not None
+    envelope = json.loads(update[2][4])
+    assert envelope["status"] == "failed"
+    assert envelope["workflow_id"] == str(JOB_ID)
+    assert envelope["tenant_id"] == str(DEFAULT_TENANT_ID)
+    assert envelope["correlation_id"] == str(CORRELATION_ID)
+    assert envelope["error"]["code"] == "analysis_execution_failed"
+    assert "private exception detail" not in update[2][4]
+    assert "workflow_result" not in body
 
     events = [
         call for call in connection.calls
