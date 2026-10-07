@@ -44,6 +44,7 @@ async def test_failed_governed_job_creation_rolls_back_gate_and_events():
             ) as client:
                 response = await client.post(
                     "/jobs",
+                    headers={"Authorization": "Bearer dev-admin"},
                     json={
                         "job_type": "metadata.analyze",
                         "request_payload": {
