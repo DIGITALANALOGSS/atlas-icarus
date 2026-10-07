@@ -511,3 +511,121 @@ async def test_failure_update_conflict_or_database_error(
         if call[0] == "execute" and "INSERT INTO events" in call[1]
     ]
     assert [call[2][2] for call in events] == ["jobs.started"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["succeeded", "failed"])
+async def test_read_persisted_workflow_result(install_pool, outcome):
+    envelope = {
+        "result_id": str(MISSING_JOB_ID),
+        "node_id": str(JOB_ID),
+        "workflow_id": str(JOB_ID),
+        "correlation_id": str(CORRELATION_ID),
+        "causation_id": None,
+        "tenant_id": str(DEFAULT_TENANT_ID),
+        "status": outcome,
+        "output": {"word_count": 3} if outcome == "succeeded" else {},
+        "sources": [],
+        "error": (
+            {
+                "code": "analysis_execution_failed",
+                "message": "Text analysis could not be completed.",
+                "retryable": False,
+                "detail": {},
+            }
+            if outcome == "failed" else None
+        ),
+        "completed_at": "2026-10-07T12:00:00Z",
+    }
+    connection, pool = install_pool(rows=[{
+        "job_id": JOB_ID,
+        "workflow_result": json.dumps(envelope),
+    }])
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/jobs/{JOB_ID}/workflow-result",
+            headers=DEFAULT_HEADERS,
+        )
+    assert response.status_code == 200, response.text
+    assert response.json() == envelope
+    assert pool.acquire_count == 1
+    assert len(connection.calls) == 1
+    query = connection.calls[0]
+    assert query[0] == "fetchrow"
+    assert "workflow_result" in query[1]
+    assert "WHERE job_id = $1 AND tenant_id = $2" in query[1]
+    assert query[2] == (JOB_ID, DEFAULT_TENANT_ID)
+
+
+@pytest.mark.asyncio
+async def test_workflow_result_not_available(install_pool):
+    install_pool(rows=[{"job_id": JOB_ID, "workflow_result": None}])
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/jobs/{JOB_ID}/workflow-result",
+            headers=DEFAULT_HEADERS,
+        )
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "workflow result is not available"
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "token", ["dev-admin", "dev-cross-tenant-operator"]
+)
+async def test_workflow_result_missing_or_other_tenant(install_pool, token):
+    connection, _ = install_pool(rows=[None])
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/jobs/{JOB_ID}/workflow-result",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == 404
+    assert response.json() == {"detail": "job not found"}
+    assert "AND tenant_id = $2" in connection.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_workflow_result_requires_authentication(install_pool):
+    connection, _ = install_pool()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/jobs/{JOB_ID}/workflow-result"
+        )
+    assert response.status_code == 401
+    assert connection.calls == []
+
+
+@pytest.mark.asyncio
+async def test_workflow_result_database_error(install_pool, monkeypatch):
+    connection, _ = install_pool()
+
+    async def broken_read(*args, **kwargs):
+        raise RuntimeError("private database detail")
+
+    monkeypatch.setattr(connection, "fetchrow", broken_read)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/jobs/{JOB_ID}/workflow-result",
+            headers=DEFAULT_HEADERS,
+        )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "database read failed"}
+    assert "private database detail" not in response.text

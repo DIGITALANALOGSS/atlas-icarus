@@ -150,6 +150,35 @@ async def test_execution_failure_commit_or_rollback(
                         DEFAULT_TENANT_ID,
                     )
 
+                own_read = await client.get(
+                    f"/jobs/{job_id}/workflow-result",
+                    headers=headers,
+                )
+                other_read = await client.get(
+                    f"/jobs/{job_id}/workflow-result",
+                    headers={
+                        "Authorization": "Bearer dev-cross-tenant-operator"
+                    },
+                )
+                assert other_read.status_code == 404, other_read.text
+                assert other_read.json() == {"detail": "job not found"}
+
+                if reject_failure_event:
+                    assert own_read.status_code == 409, own_read.text
+                    assert own_read.json() == {
+                        "detail": "workflow result is not available"
+                    }
+                else:
+                    assert own_read.status_code == 200, own_read.text
+                    stored = after["workflow_result"]
+                    if isinstance(stored, str):
+                        stored = json.loads(stored)
+                    expected_result = WorkflowNodeResult.model_validate(stored)
+                    read_result = WorkflowNodeResult.model_validate(
+                        own_read.json()
+                    )
+                    assert read_result == expected_result
+
                 assert "private integration adapter detail" not in response.text
                 if reject_failure_event:
                     assert response.status_code == 503, response.text

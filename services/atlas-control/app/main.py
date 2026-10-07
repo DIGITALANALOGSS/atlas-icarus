@@ -1194,6 +1194,47 @@ async def get_job(
     return serialize_job(row)
 
 
+@app.get(
+    "/jobs/{job_id}/workflow-result",
+    response_model=WorkflowNodeResult,
+)
+async def get_job_workflow_result(
+    job_id: UUID,
+    principal: Principal = Depends(require_permission('jobs:read')),
+) -> WorkflowNodeResult:
+    try:
+        async with app.state.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT job_id, workflow_result
+                FROM jobs
+                WHERE job_id = $1 AND tenant_id = $2
+                """,
+                job_id,
+                principal.tenant_id,
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database read failed",
+        ) from exc
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="job not found",
+        )
+    if row["workflow_result"] is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="workflow result is not available",
+        )
+    return WorkflowNodeResult.model_validate(
+        decode_json_object(row["workflow_result"])
+    )
+
+
+
 
 
 @app.post("/jobs/{job_id}/execute")
