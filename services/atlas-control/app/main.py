@@ -1270,28 +1270,73 @@ async def execute_job(
                     },
                 )
 
-                request_payload = decode_json_object(row["request_payload"])
-                content = request_payload["content"]
-                completed_at = datetime.now(timezone.utc)
-                # Local convention: one job is one workflow with one node.
-                node_request = WorkflowNodeRequest(
-                    node_id=row["job_id"],
-                    workflow_id=row["job_id"],
-                    correlation_id=row["correlation_id"],
-                    tenant_id=principal.tenant_id,
-                    actor_id=actor_id_for_subject(
-                        principal.tenant_id, principal.subject_id
-                    ),
-                    node_type="metadata.analyze",
-                    input={"content": content},
-                    created_at=started_at,
-                )
-                node_result = execute_text_analysis(
-                    node_request,
-                    completed_at=completed_at,
-                    analyzed_at=serialize_datetime(completed_at),
-                )
-                result_payload = node_result.output
+                try:
+                    request_payload = decode_json_object(row["request_payload"])
+                    content = request_payload["content"]
+                    completed_at = datetime.now(timezone.utc)
+                    # Local convention: one job is one workflow with one node.
+                    node_request = WorkflowNodeRequest(
+                        node_id=row["job_id"],
+                        workflow_id=row["job_id"],
+                        correlation_id=row["correlation_id"],
+                        tenant_id=principal.tenant_id,
+                        actor_id=actor_id_for_subject(
+                            principal.tenant_id, principal.subject_id
+                        ),
+                        node_type="metadata.analyze",
+                        input={"content": content},
+                        created_at=started_at,
+                    )
+                    node_result = execute_text_analysis(
+                        node_request,
+                        completed_at=completed_at,
+                        analyzed_at=serialize_datetime(completed_at),
+                    )
+                    result_payload = node_result.output
+                except Exception:
+                    # Only input preparation and adapter execution are caught here.
+                    # Database and audit failures still reach the outer exception handler.
+                    failed_at = datetime.now(timezone.utc)
+                    error_code = "analysis_execution_failed"
+                    failed = await connection.fetchrow(
+                        """
+                        UPDATE jobs
+                        SET
+                          status = 'failed',
+                          result_payload = NULL,
+                          error_code = $3,
+                          completed_at = $4
+                        WHERE job_id = $1
+                          AND tenant_id = $2
+                          AND status = 'running'
+                        RETURNING
+                          job_id, job_type, request_payload, status,
+                          approval_required, approval_gate_id, correlation_id,
+                          result_payload, error_code, created_at, started_at, completed_at
+                        """,
+                        job_id,
+                        principal.tenant_id,
+                        error_code,
+                        failed_at,
+                    )
+                    if failed is None:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="job could not be marked failed",
+                        )
+                    await write_event(
+                        connection,
+                        tenant_id=principal.tenant_id,
+                        event_type="jobs.failed",
+                        correlation_id=failed["correlation_id"],
+                        occurred_at=failed_at,
+                        payload={
+                            "job_id": str(failed["job_id"]),
+                            "status": "failed",
+                            "error_code": error_code,
+                        },
+                    )
+                    return serialize_job(failed)
 
                 completed = await connection.fetchrow(
                     """

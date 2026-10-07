@@ -391,3 +391,107 @@ async def test_execute_job_returns_404_without_writes_when_not_visible_to_tenant
     assert visibility_lookup[2] == (MISSING_JOB_ID, DEFAULT_TENANT_ID)
 
     assert not any(call[0] == "execute" for call in connection.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+async def test_adapter_failure_records_failed_job(
+    install_pool, monkeypatch, error_type
+):
+    from app import main as main_module
+
+    started = executable_job_row("running")
+    failed = executable_job_row(
+        "failed", completed_at=datetime.now(timezone.utc)
+    )
+    failed["error_code"] = "analysis_execution_failed"
+    connection, pool = install_pool(rows=[started, failed])
+
+    def broken_adapter(*args, **kwargs):
+        raise error_type("private exception detail")
+
+    monkeypatch.setattr(
+        main_module, "execute_text_analysis", broken_adapter
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/jobs/{JOB_ID}/execute", headers=WORKER_HEADERS
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["error_code"] == "analysis_execution_failed"
+    assert body["result_payload"] is None
+    assert body["completed_at"] is not None
+    assert "private exception detail" not in response.text
+    assert pool.acquire_count == 1
+    assert len(connection.calls) == 5
+
+    update = connection.calls[3]
+    assert update[0] == "fetchrow"
+    assert "status = 'failed'" in update[1]
+    assert "result_payload = NULL" in update[1]
+    assert "AND tenant_id = $2" in update[1]
+    assert "AND status = 'running'" in update[1]
+    assert update[2][:3] == (
+        JOB_ID, DEFAULT_TENANT_ID, "analysis_execution_failed"
+    )
+    assert update[2][3].tzinfo is not None
+
+    events = [
+        call for call in connection.calls
+        if call[0] == "execute" and "INSERT INTO events" in call[1]
+    ]
+    assert [call[2][2] for call in events] == [
+        "jobs.started", "jobs.failed"
+    ]
+    assert all(call[2][5] == CORRELATION_ID for call in events)
+    assert "private exception detail" not in repr(events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("database_failure", [False, True])
+async def test_failure_update_conflict_or_database_error(
+    install_pool, monkeypatch, database_failure
+):
+    from app import main as main_module
+
+    connection, _ = install_pool(
+        rows=[executable_job_row("running"), None]
+    )
+
+    def broken_adapter(*args, **kwargs):
+        raise RuntimeError("private adapter detail")
+
+    monkeypatch.setattr(
+        main_module, "execute_text_analysis", broken_adapter
+    )
+    if database_failure:
+        original_fetchrow = connection.fetchrow
+
+        async def failing_fetchrow(query, *args):
+            if "status = 'failed'" in query:
+                raise RuntimeError("private database detail")
+            return await original_fetchrow(query, *args)
+
+        monkeypatch.setattr(connection, "fetchrow", failing_fetchrow)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/jobs/{JOB_ID}/execute", headers=WORKER_HEADERS
+        )
+
+    assert response.status_code == (503 if database_failure else 409)
+    assert "private" not in response.text
+    events = [
+        call for call in connection.calls
+        if call[0] == "execute" and "INSERT INTO events" in call[1]
+    ]
+    assert [call[2][2] for call in events] == ["jobs.started"]
