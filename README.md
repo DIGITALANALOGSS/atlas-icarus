@@ -76,8 +76,8 @@ when a tenant-visible job has no persisted envelope.
 
 ## Next milestones
 
-Candidate follow-on work includes registering verified preservation
-manifests with intake/evidence records, and a user-facing interface.
+Candidate follow-on work includes registration recovery/idempotency
+and a user-facing interface.
 These are not implemented by the operator CLI.
 
 ## Local file preservation
@@ -94,3 +94,14 @@ python3 -m unittest discover -s scripts -p 'test_atlas_*.py' -v
 
 Preservation means verified byte copies at collection time, not immutable
 archival storage or a complete chain of custody.
+
+## Preservation registration
+
+`scripts/atlas_register.py` explicitly registers verified preservation
+manifests as intake and evidence metadata. It saves a separate staged
+receipt and does not submit jobs. See `docs/preservation-registration.md`
+for partial-failure handling and usage.
+
+Registration consists of two API requests, not one atomic transaction.
+Existing receipts prevent automatic retries; ambiguous attempts require
+review rather than blind repetition.
