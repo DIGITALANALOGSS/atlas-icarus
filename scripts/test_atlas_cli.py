@@ -41,6 +41,23 @@ class CLITests(unittest.TestCase):
             self.assertEqual(payload["request_payload"]["content"], content)
             self.assertEqual(path.read_text(encoding="utf-8"), content)
 
+    def test_linked_submission_preserves_crlf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "working.txt"
+            raw = b"first line\r\nsecond line\r\n"
+            path.write_bytes(raw)
+            client = FakeClient()
+            args = cli.parser().parse_args([
+                "submit", str(path), "--evidence-id", GATE
+            ])
+            cli.dispatch(args, client)
+            payload = client.calls[0][2]
+            self.assertEqual(payload["evidence_id"], GATE)
+            self.assertEqual(
+                payload["request_payload"]["content"].encode("utf-8"), raw
+            )
+            self.assertEqual(path.read_bytes(), raw)
+
     def test_explicit_ungated_and_correlation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "working.txt"

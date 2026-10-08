@@ -48,7 +48,7 @@ def validate_base_url(value):
 
 def read_content(filename):
     try:
-        content = Path(filename).read_text(encoding="utf-8")
+        content = Path(filename).read_bytes().decode("utf-8")
     except (OSError, UnicodeError) as exc:
         raise CLIError("cannot read input as a UTF-8 text file") from exc
     if not content.strip():
@@ -121,6 +121,7 @@ def parser():
         help="explicitly create a job without an approval gate",
     )
     submit.add_argument("--correlation-id", type=uuid_value)
+    submit.add_argument("--evidence-id", type=uuid_value)
     for name in ("show", "execute", "result", "approve", "reject"):
         command = commands.add_parser(name)
         command.add_argument("job_id", type=uuid_value)
@@ -137,6 +138,8 @@ def dispatch(args, client):
             "request_payload": {"content": read_content(args.file)},
             "approval_required": not args.ungated,
         }
+        if args.evidence_id:
+            payload["evidence_id"] = args.evidence_id
         if args.correlation_id:
             payload["correlation_id"] = args.correlation_id
         return client.request("POST", "/jobs", payload)

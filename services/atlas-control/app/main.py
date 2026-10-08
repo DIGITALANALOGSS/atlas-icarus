@@ -179,6 +179,7 @@ JOB_STATUSES = {
 
 
 class JobCreate(BaseModel):
+    evidence_id: UUID | None = None
     job_type: str = Field(min_length=3, max_length=255)
     request_payload: dict = Field(default_factory=dict)
     approval_required: bool = False
@@ -964,6 +965,10 @@ async def decide_approval_gate(
 
 def serialize_job(row) -> dict:
     return {
+        "evidence_id": (
+            str(row["evidence_id"])
+            if row.get("evidence_id") is not None else None
+        ),
         "job_id": str(row["job_id"]),
         "job_type": row["job_type"],
         "request_payload": decode_json_object(row["request_payload"]),
@@ -1031,6 +1036,39 @@ async def create_job(
     try:
         async with app.state.pool.acquire() as connection:
             async with connection.transaction():
+                if job.evidence_id is not None:
+                    evidence = await connection.fetchrow(
+                        """
+                        SELECT evidence_id, sha256, correlation_id
+                        FROM evidence_records
+                        WHERE evidence_id = $1 AND tenant_id = $2
+                        FOR SHARE
+                        """,
+                        job.evidence_id,
+                        principal.tenant_id,
+                    )
+                    if evidence is None:
+                        raise HTTPException(
+                            status_code=status.HTTP_404_NOT_FOUND,
+                            detail="evidence record not found",
+                        )
+                    submitted_sha256 = hashlib.sha256(
+                        job.request_payload["content"].encode("utf-8")
+                    ).hexdigest()
+                    if submitted_sha256 != evidence["sha256"]:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="content does not match evidence digest",
+                        )
+                    if (
+                        job.correlation_id is not None
+                        and job.correlation_id != evidence["correlation_id"]
+                    ):
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="correlation does not match evidence",
+                        )
+                    correlation_id = evidence["correlation_id"]
                 if approval_gate_id is not None:
                     approval_summary = (
                         f"Approve execution of job {job_id} "
@@ -1039,6 +1077,10 @@ async def create_job(
                     approval_payload = {
                         "job_id": str(job_id),
                         "job_type": job.job_type,
+                        "evidence_id": (
+                            str(job.evidence_id)
+                            if job.evidence_id is not None else None
+                        ),
                         "request_payload": job.request_payload,
                     }
 
@@ -1081,9 +1123,10 @@ async def create_job(
                     """
                     INSERT INTO jobs (
                       job_id, job_type, request_payload, status,
-                      approval_required, approval_gate_id, correlation_id, tenant_id
+                      approval_required, approval_gate_id, correlation_id, tenant_id,
+                      evidence_id
                     )
-                    VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8)
+                    VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9)
                     """,
                     job_id,
                     job.job_type,
@@ -1093,6 +1136,7 @@ async def create_job(
                     approval_gate_id,
                     correlation_id,
                     principal.tenant_id,
+                    job.evidence_id,
                 )
 
                 await write_event(
@@ -1104,6 +1148,10 @@ async def create_job(
                     payload={
                         "job_id": str(job_id),
                         "job_type": job.job_type,
+                        "evidence_id": (
+                            str(job.evidence_id)
+                            if job.evidence_id is not None else None
+                        ),
                         "status": job_status,
                         "approval_required": job.approval_required,
                         "approval_gate_id": (
@@ -1134,6 +1182,8 @@ async def create_job(
                         ),
                     },
                 )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1143,6 +1193,10 @@ async def create_job(
     return {
         "job_id": str(job_id),
         "job_type": job.job_type,
+                        "evidence_id": (
+                            str(job.evidence_id)
+                            if job.evidence_id is not None else None
+                        ),
         "request_payload": job.request_payload,
         "status": job_status,
         "approval_required": job.approval_required,
@@ -1172,7 +1226,7 @@ async def get_job(
                 SELECT
                   job_id, job_type, request_payload, status,
                   approval_required, approval_gate_id, correlation_id,
-                  result_payload, error_code, created_at, started_at, completed_at
+                  result_payload, error_code, created_at, started_at, completed_at, evidence_id
                 FROM jobs
                 WHERE job_id = $1 AND tenant_id = $2
                 """,
@@ -1257,7 +1311,7 @@ async def execute_job(
                     RETURNING
                       job_id, job_type, request_payload, status,
                       approval_required, approval_gate_id, correlation_id,
-                      result_payload, error_code, created_at, started_at, completed_at
+                      result_payload, error_code, created_at, started_at, completed_at, evidence_id
                     """,
                     job_id,
                     principal.tenant_id,
@@ -1270,7 +1324,7 @@ async def execute_job(
                         SELECT
                           job_id, job_type, request_payload, status,
                           approval_required, approval_gate_id, correlation_id,
-                          result_payload, error_code, created_at, started_at, completed_at
+                          result_payload, error_code, created_at, started_at, completed_at, evidence_id
                         FROM jobs
                         WHERE job_id = $1 AND tenant_id = $2
                         """,
@@ -1367,7 +1421,7 @@ async def execute_job(
                         RETURNING
                           job_id, job_type, request_payload, status,
                           approval_required, approval_gate_id, correlation_id,
-                          result_payload, error_code, created_at, started_at, completed_at
+                          result_payload, error_code, created_at, started_at, completed_at, evidence_id
                         """,
                         job_id,
                         principal.tenant_id,
@@ -1407,7 +1461,7 @@ async def execute_job(
                     RETURNING
                       job_id, job_type, request_payload, status,
                       approval_required, approval_gate_id, correlation_id,
-                      result_payload, error_code, created_at, started_at, completed_at
+                      result_payload, error_code, created_at, started_at, completed_at, evidence_id
                     """,
                     job_id,
                     principal.tenant_id,

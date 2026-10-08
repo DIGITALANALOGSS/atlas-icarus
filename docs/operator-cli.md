@@ -86,3 +86,24 @@ python3 -m unittest discover -s scripts -p 'test_atlas_cli.py' -v
 
 These use fake HTTP responses and temporary files; they do not contact the
 running service or database.
+
+## Evidence-linked submission
+
+```bash
+python3 scripts/atlas_cli.py submit /path/to/working-copy.txt --evidence-id EVIDENCE_UUID
+```
+
+The evidence must exist in the authenticated tenant. The backend compares
+the SHA-256 of the submitted UTF-8 content with the evidence digest.
+The CLI preserves line endings when reading the text file.
+
+Linked jobs inherit the evidence correlation ID. An explicitly supplied,
+different correlation ID is rejected. Digest and correlation mismatches
+return HTTP 409; unavailable evidence returns HTTP 404.
+
+The job response includes `evidence_id`. A composite database foreign key
+enforces same-tenant linkage and prevents deleting referenced evidence.
+Unlinked submissions remain supported.
+
+This verifies correspondence to registered metadata, not trustworthy
+collection of the original. It does not copy files or fetch storage URLs.

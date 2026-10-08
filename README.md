@@ -7,7 +7,8 @@ Control FastAPI service, PostgreSQL, and Docker Compose.
 
 - Tenant-scoped intake metadata, evidence records, and intake audit events.
 - Approval gates with atomic decisions and linked job transitions.
-- Governed `metadata.analyze` jobs.
+- Governed `metadata.analyze` jobs with optional same-tenant evidence linkage.
+- Digest-checked linked submissions inheriting evidence correlation.
 - Character count, whitespace-separated word count, and SHA-256 analysis.
 - Stored responses for successful-job execution retries.
 - Sanitized adapter failures and transactional job/audit persistence.
@@ -54,7 +55,7 @@ containerized tests, readiness checks, and the live smoke workflow.
 
 ## Database migrations
 
-Migrations `001` through `011` reside in
+Migrations `001` through `012` reside in
 `services/atlas-control/migrations/`. Application startup applies pending
 migrations transactionally before serving requests.
 
@@ -75,6 +76,6 @@ when a tenant-visible job has no persisted envelope.
 
 ## Next milestones
 
-Candidate follow-on work includes durable evidence-to-job linkage,
-controlled file preservation and manifests, and a user-facing interface.
+Candidate follow-on work includes controlled file preservation and
+manifests, and a user-facing interface.
 These are not implemented by the operator CLI.

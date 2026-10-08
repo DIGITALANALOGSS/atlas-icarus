@@ -122,6 +122,7 @@ async def test_get_job_returns_tenant_scoped_serialized_job(install_pool):
 
     assert response.status_code == 200
     assert response.json() == {
+        "evidence_id": None,
         "job_id": str(JOB_ID),
         "job_type": "research.summarize",
         "request_payload": {"topic": "tenant isolation"},
@@ -322,6 +323,7 @@ async def test_execute_succeeded_job_returns_stored_result_without_duplicate_wri
 
     assert response.status_code == 200
     assert response.json() == {
+        "evidence_id": None,
         "job_id": str(JOB_ID),
         "job_type": "research.summarize",
         "request_payload": {"content": "tenant isolation execution"},
@@ -629,3 +631,105 @@ async def test_workflow_result_database_error(install_pool, monkeypatch):
     assert response.status_code == 503
     assert response.json() == {"detail": "database read failed"}
     assert "private database detail" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_create_evidence_linked_job(install_pool):
+    import hashlib
+
+    content = "linked evidence text"
+    evidence = {
+        "evidence_id": MISSING_JOB_ID,
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "correlation_id": CORRELATION_ID,
+    }
+    connection, _ = install_pool(rows=[evidence])
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/jobs", headers=DEFAULT_HEADERS,
+            json={
+                "job_type": "metadata.analyze",
+                "request_payload": {"content": content},
+                "evidence_id": str(MISSING_JOB_ID),
+                "approval_required": True,
+            },
+        )
+    assert response.status_code == 201, response.text
+    assert response.json()["evidence_id"] == str(MISSING_JOB_ID)
+    assert response.json()["correlation_id"] == str(CORRELATION_ID)
+    lookup = connection.calls[1]
+    assert lookup[0] == "fetchrow"
+    assert "WHERE evidence_id = $1 AND tenant_id = $2" in lookup[1]
+    assert lookup[2] == (MISSING_JOB_ID, DEFAULT_TENANT_ID)
+    insert = next(
+        call for call in connection.calls
+        if call[0] == "execute" and "INSERT INTO jobs" in call[1]
+    )
+    assert insert[2][6] == CORRELATION_ID
+    assert insert[2][8] == MISSING_JOB_ID
+    gate = next(
+        call for call in connection.calls
+        if call[0] == "execute" and "INSERT INTO approval_gates" in call[1]
+    )
+    assert json.loads(gate[2][4])["evidence_id"] == str(MISSING_JOB_ID)
+    events = [
+        json.loads(call[2][7]) for call in connection.calls
+        if call[0] == "execute" and "INSERT INTO events" in call[1]
+        and call[2][2] == "jobs.created"
+    ]
+    assert events[0]["evidence_id"] == str(MISSING_JOB_ID)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["missing", "digest", "correlation"])
+async def test_invalid_evidence_link_has_no_writes(install_pool, case):
+    import hashlib
+
+    content = "linked evidence text"
+    evidence = {
+        "evidence_id": MISSING_JOB_ID,
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "correlation_id": CORRELATION_ID,
+    }
+    if case == "missing":
+        evidence = None
+    elif case == "digest":
+        evidence["sha256"] = "0" * 64
+    connection, _ = install_pool(rows=[evidence])
+    payload = {
+        "job_type": "metadata.analyze",
+        "request_payload": {"content": content},
+        "evidence_id": str(MISSING_JOB_ID),
+        "approval_required": True,
+    }
+    if case == "correlation":
+        payload["correlation_id"] = str(JOB_ID)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/jobs", headers=DEFAULT_HEADERS, json=payload,
+        )
+    assert response.status_code == (404 if case == "missing" else 409)
+    assert not any(call[0] == "execute" for call in connection.calls)
+
+
+@pytest.mark.asyncio
+async def test_invalid_evidence_uuid_rejected_before_database(install_pool):
+    connection, pool = install_pool()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/jobs", headers=DEFAULT_HEADERS,
+            json={
+                "job_type": "metadata.analyze",
+                "request_payload": {"content": "example"},
+                "evidence_id": "not-a-uuid",
+            },
+        )
+    assert response.status_code == 422
+    assert pool.acquire_count == 0
+    assert connection.calls == []
