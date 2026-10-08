@@ -1,127 +1,80 @@
 # Atlas ICARUS
 
-Atlas ICARUS is a local-first platform foundation. The current implementation includes an Atlas Control FastAPI service, PostgreSQL persistence, intake-item evidence records, Docker Compose local development, and automated endpoint tests.
+Atlas ICARUS is a local-first platform foundation built around the Atlas
+Control FastAPI service, PostgreSQL, and Docker Compose.
 
-## Current service
+## Implemented capabilities
 
-`services/atlas-control` provides the Atlas Control API.
+- Tenant-scoped intake metadata, evidence records, and intake audit events.
+- Approval gates with atomic decisions and linked job transitions.
+- Governed `metadata.analyze` jobs.
+- Character count, whitespace-separated word count, and SHA-256 analysis.
+- Stored responses for successful-job execution retries.
+- Sanitized adapter failures and transactional job/audit persistence.
+- Persisted typed workflow results and tenant-scoped result retrieval.
+- A local operator CLI using the existing authenticated API.
 
-The local Compose stack includes:
+This is not yet an AI summarization system, a file-preservation pipeline,
+or a graphical application. An API storage reference does not prove that
+a file has been copied or preserved.
 
-- `postgres`: PostgreSQL 16 database with persistent Docker volume storage
-- `atlas-control`: FastAPI application
-- `atlas-control-tests`: isolated test-runner service enabled only through the `test` Compose profile
+## Local setup
 
-Both database and API ports bind to `127.0.0.1`, keeping them available only on the local machine by default.
+Requires Docker Engine, Docker Compose v2, and Python 3.
 
-## Prerequisites
-
-- Docker Engine with Docker Compose v2
-- A `.env` file at the repository root containing:
-
-```dotenv
-POSTGRES_DB=atlas
-POSTGRES_USER=atlas
-POSTGRES_PASSWORD=replace-with-a-long-local-password
-POSTGRES_PORT=5432
-```
-
-Do not commit `.env` files or credentials.
-
-## Start the local service
-
-Build and start Atlas Control and its PostgreSQL dependency:
+Create a local `.env` using `.env.example`. Never commit credentials.
 
 ```bash
-docker compose -f compose.yaml up -d --build atlas-control
+make up
 ```
 
-The API is available locally at:
+The API and database bind to the local machine by default.
+API documentation: `http://127.0.0.1:8000/docs`.
 
-```text
-http://127.0.0.1:8000
-```
+## Operator CLI
 
-FastAPI interactive documentation is available at:
-
-```text
-http://127.0.0.1:8000/docs
-```
-
-## Run tests
-
-Run the isolated Atlas Control test container:
+See `docs/operator-cli.md` for the governed workflow.
 
 ```bash
-docker compose -f compose.yaml --profile test run --rm --build atlas-control-tests
+python3 scripts/atlas_cli.py --help
 ```
 
-The evidence-record suite currently verifies:
+The CLI uses Python's standard library. It accepts UTF-8 working-copy text,
+does not change that file, and requires approval by default.
 
-- Successful evidence-record retrieval and response serialization
-- `404` behavior for missing evidence records
-- UUID validation before database access
-- `503` behavior for database query failures
-
-## Current evidence API
-
-### Get one evidence record
-
-```text
-GET /evidence-records/{evidence_id}
-```
-
-The endpoint returns a serialized evidence record, including its intake identifier, SHA-256 digest, controlled storage reference, metadata, correlation identifier, and creation timestamp.
-
-Example:
+## Verification
 
 ```bash
-curl http://127.0.0.1:8000/evidence-records/YOUR-EVIDENCE-UUID
+python3 -m unittest discover -s scripts -p 'test_atlas_cli.py' -v
+make verify
 ```
+
+`make verify` runs isolated PostgreSQL integration tests, the existing
+containerized tests, readiness checks, and the live smoke workflow.
 
 ## Database migrations
 
-Atlas Control migrations are stored in:
+Migrations `001` through `011` reside in
+`services/atlas-control/migrations/`. Application startup applies pending
+migrations transactionally before serving requests.
 
-```text
-services/atlas-control/migrations/
-```
+Migration `011` adds nullable persisted workflow results.
+Historical jobs are not backfilled. The result endpoint returns HTTP 409
+when a tenant-visible job has no persisted envelope.
 
-Current migrations:
+## Safety and boundaries
 
-- `001_initial.sql`: initial intake-item schema
-- `002_evidence_records.sql`: evidence-record table and indexes
+- Preserve originals outside the repository; analyze a separate working copy.
+- Keep tokens, personal data, and original research files out of Git.
+- Current authentication uses development identities; do not assume
+  production identity management is implemented.
+- CLI approval commands remain subject to server permission checks.
+- Shared correlation IDs are not a durable job-to-evidence relationship.
+- Use `make down` to stop services while preserving local database data.
+- Do not use `docker compose down -v` unless you intend to erase that data.
 
-The evidence table indexes intake records by descending creation time and also indexes SHA-256 and correlation identifiers.
+## Next milestones
 
-## Useful commands
-
-Check repository state:
-
-```bash
-git status --short
-```
-
-Review service logs:
-
-```bash
-docker compose -f compose.yaml logs -f atlas-control
-```
-
-Stop local containers while preserving the PostgreSQL volume:
-
-```bash
-docker compose -f compose.yaml down
-```
-
-Stop containers and delete local PostgreSQL data:
-
-```bash
-docker compose -f compose.yaml down -v
-```
-
-Use `down -v` only when you intentionally want to erase local development data.
-
-## Next planned capability
-
-The next API capability is an intake-scoped, read-only evidence list endpoint with validated pagination and automated tests.
+Candidate follow-on work includes durable evidence-to-job linkage,
+controlled file preservation and manifests, and a user-facing interface.
+These are not implemented by the operator CLI.

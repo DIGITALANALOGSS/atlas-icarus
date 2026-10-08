@@ -2,6 +2,18 @@
 
 Run these commands from the repository root.
 
+## Operator commands
+
+See [operator-cli.md](operator-cli.md) for the governed local job workflow.
+
+Run isolated CLI tests before backend verification:
+
+```bash
+python3 -m unittest discover -s scripts -p 'test_atlas_cli.py' -v
+```
+
+`make verify` also runs the isolated PostgreSQL integration suite before the existing backend verification workflow.
+
 ## Daily workflow
 
 ```bash
