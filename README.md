@@ -15,7 +15,7 @@ Control FastAPI service, PostgreSQL, and Docker Compose.
 - Persisted typed workflow results and tenant-scoped result retrieval.
 - A local operator CLI using the existing authenticated API.
 
-This is not yet an AI summarization system, a file-preservation pipeline,
+This is not yet an AI summarization system, an automatically registered file-ingestion pipeline,
 or a graphical application. An API storage reference does not prove that
 a file has been copied or preserved.
 
@@ -76,6 +76,21 @@ when a tenant-visible job has no persisted envelope.
 
 ## Next milestones
 
-Candidate follow-on work includes controlled file preservation and
-manifests, and a user-facing interface.
+Candidate follow-on work includes registering verified preservation
+manifests with intake/evidence records, and a user-facing interface.
 These are not implemented by the operator CLI.
+
+## Local file preservation
+
+`scripts/atlas_preserve.py` creates digest-verified preserved and working
+copies plus a manifest outside the repository. It performs no automatic
+API registration. See `docs/file-preservation.md` for usage and limitations.
+
+Run all local tool tests:
+
+```bash
+python3 -m unittest discover -s scripts -p 'test_atlas_*.py' -v
+```
+
+Preservation means verified byte copies at collection time, not immutable
+archival storage or a complete chain of custody.
