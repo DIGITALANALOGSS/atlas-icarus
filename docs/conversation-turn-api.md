@@ -25,6 +25,14 @@ Expired running turns become failed with lease_expired on execution, status
 access, or cancellation in the owned conversation. No periodic worker,
 heartbeat, automatic retry, or durable background dispatcher is provided.
 
+Reservation and claim commit separately. Interruption after reservation but
+before claim can leave a queued turn with no lease. Status access does not
+expire it, and it blocks turns for other user messages in that conversation.
+Retry execution for the same user message to claim the existing queued turn,
+or explicitly cancel that queued turn to release the active-turn slot.
+Cancellation prevents assistant publication; it does not stop provider work
+already in progress.
+
 HTTP: 200 success/replay; 401 unauthenticated; 403 insufficient permissions;
 404 inaccessible resource; 409 lifecycle conflict/non-user source;
 422 invalid input; 502 model error; 503 database/audit/unclassified execution

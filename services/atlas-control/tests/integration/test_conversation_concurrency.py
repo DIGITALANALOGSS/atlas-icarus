@@ -269,3 +269,111 @@ async def test_abandoned_execution_expires_without_publication(
             "AND event_type='governance.conversation.turn.failed'",
             abandoned["correlation_id"],
         ) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["same_message_retry", "queued_cancel"])
+async def test_reserved_unclaimed_turn_recovery(conversation_case, recovery):
+    pool, principal, cid, user = conversation_case
+    reserved = await reserve_turn(
+        pool, principal, cid, user, write_event=write_event,
+    )
+    assert reserved["status"] == "queued"
+    assert reserved["attempt"] == 0
+    assert reserved["worker_token"] is None
+    assert reserved["lease_expires_at"] is None
+
+    headers = {"Authorization": "Bearer dev-requester"}
+    detail = f"/conversations/{cid}/turns/{reserved['turn_id']}"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test",
+    ) as client:
+        response = await client.get(detail, headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "queued"
+
+        later = await client.post(
+            f"/conversations/{cid}/messages",
+            headers=headers, json={"content": "Second"},
+        )
+        assert later.status_code == 201, later.text
+        from uuid import UUID
+        later_user = UUID(later.json()["message_id"])
+
+        with pytest.raises(
+            ConversationCoordinatorError, match="conversation has an active turn",
+        ):
+            await reserve_turn(
+                pool, principal, cid, later_user, write_event=write_event,
+            )
+
+        if recovery == "same_message_retry":
+            calls = []
+
+            class Model:
+                async def complete(self, messages):
+                    calls.append(messages)
+                    assert [(m.role, m.content) for m in messages] == [
+                        ("user", "First"),
+                    ]
+                    return "Recovered reply"
+
+            model = Model()
+            result = await execute_turn(
+                pool, principal, cid, user,
+                model=model, write_event=write_event,
+            )
+            assert result["turn"]["turn_id"] == reserved["turn_id"]
+            assert result["turn"]["status"] == "completed"
+            assert result["turn"]["attempt"] == 1
+            assert result["message"]["content"] == "Recovered reply"
+
+            replay = await execute_turn(
+                pool, principal, cid, user,
+                model=model, write_event=write_event,
+            )
+            assert replay == result
+            assert len(calls) == 1
+        else:
+            cancelled = await client.post(detail + "/cancel", headers=headers)
+            assert cancelled.status_code == 200, cancelled.text
+            assert cancelled.json()["status"] == "cancelled"
+            assert cancelled.json()["attempt"] == 0
+
+            repeated = await client.post(detail + "/cancel", headers=headers)
+            assert repeated.status_code == 200, repeated.text
+            assert repeated.json() == cancelled.json()
+
+            async with pool.acquire() as connection:
+                assert await connection.fetchval(
+                    "SELECT count(*) FROM conversation_messages "
+                    "WHERE conversation_id=$1 AND role='assistant'", cid,
+                ) == 0
+
+        following = await reserve_turn(
+            pool, principal, cid, later_user, write_event=write_event,
+        )
+        assert following["status"] == "queued"
+        assert following["turn_id"] != reserved["turn_id"]
+
+    async with pool.acquire() as connection:
+        assert await connection.fetchval(
+            "SELECT count(*) FROM conversation_turns "
+            "WHERE tenant_id=$1 AND conversation_id=$2 AND user_message_id=$3",
+            principal.tenant_id, cid, user,
+        ) == 1
+        assert await connection.fetchval(
+            "SELECT count(*) FROM events WHERE correlation_id=$1 "
+            "AND event_type='governance.conversation.turn.queued'",
+            reserved["correlation_id"],
+        ) == 1
+        expected_event = (
+            "governance.conversation.turn.completed"
+            if recovery == "same_message_retry"
+            else "governance.conversation.turn.cancelled"
+        )
+        assert await connection.fetchval(
+            "SELECT count(*) FROM events WHERE correlation_id=$1 "
+            "AND event_type=$2",
+            reserved["correlation_id"], expected_event,
+        ) == 1
