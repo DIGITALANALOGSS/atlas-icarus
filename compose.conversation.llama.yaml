@@ -1,0 +1,8 @@
+services:
+  atlas-control:
+    environment:
+      ATLAS_CONVERSATION_MODEL: llama_cpp
+      ATLAS_MODEL_BASE_URL: http://host.docker.internal:8080/v1
+      ATLAS_MODEL_NAME: atlas-qwen
+      ATLAS_MODEL_TIMEOUT_SECONDS: "60"
+      ATLAS_MODEL_API_KEY: ${ATLAS_MODEL_API_KEY:?Model API key is required}
