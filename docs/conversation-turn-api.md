@@ -33,8 +33,11 @@ error; 504 execution timeout.
 Lifecycle integration cases cover success/replay, model failure, cancellation,
 expiry/stale publication, and publication audit rollback, plus request and
 owner/path checks. The rollback harness uses one physical connection.
-Separate-connection contention, cross-tenant cases, cancellation during model
-execution, process interruption, and timeout still need dedicated coverage.
+Additional integration cases cover separate-connection claim contention,
+cancellation during blocked generation, timeout recovery, and execution-coroutine
+interruption recovery. The PostgreSQL integration suite passed 16 cases.
+Coroutine interruption is not operating-system process termination.
+Cross-tenant cases and process-termination recovery still need dedicated coverage.
 
 This patch does not restart services or migrate the application database.
 Production activation requires a separate deployment/migration decision.
