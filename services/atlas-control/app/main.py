@@ -192,6 +192,8 @@ class ConversationCreate(BaseModel):
 
 
 class ConversationMessageCreate(BaseModel):
+    model_config = {"extra": "forbid"}
+
     content: str = Field(min_length=1, max_length=20000)
     client_message_id: UUID | None = None
 
@@ -292,6 +294,8 @@ async def lifespan(app: FastAPI):
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL is not configured")
+
+    app.state.conversation_model = configured_conversation_model()
 
     pool = await asyncpg.create_pool(
         database_url,
@@ -1831,3 +1835,10 @@ async def reject_approval_gate(
     principal: Principal = Depends(require_permission("approval-gates:decide")),
 ) -> dict:
     return await decide_approval_gate(gate_id, decision, "rejected", principal)
+
+
+from app.conversation_turn_routes import (
+    configured_conversation_model, register_conversation_turn_routes,
+)
+
+register_conversation_turn_routes(app, write_event)

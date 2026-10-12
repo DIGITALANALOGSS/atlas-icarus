@@ -40,3 +40,8 @@ status:
 
 logs:
 >@$(COMPOSE) logs -f atlas-control
+
+.PHONY: validate-local
+validate-local:
+>@test -x .venv/bin/python || { echo "Missing project virtual environment"; exit 1; }
+>@.venv/bin/python -m pytest -q services/atlas-control/tests; tests=$$?; git diff --check; whitespace=$$?; git diff --stat; printf "\nTests: %s | Whitespace: %s\n" "$$tests" "$$whitespace"; test "$$tests" -eq 0 && test "$$whitespace" -eq 0

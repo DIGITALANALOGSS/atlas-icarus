@@ -1,0 +1,494 @@
+from uuid import uuid4
+
+from app.auth import Principal
+
+
+class ConversationCoordinatorError(RuntimeError):
+    pass
+
+
+async def claim_turn(pool, principal: Principal, turn_id, *, write_event, lease_seconds=90):
+    required = {"conversations:read", "conversations:write"}
+    if not required.issubset(principal.permissions):
+        raise ConversationCoordinatorError("permission denied")
+    if type(lease_seconds) is not int or not 1 <= lease_seconds <= 600:
+        raise ConversationCoordinatorError("lease must be an integer from 1 to 600 seconds")
+    token = uuid4()
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            row = await connection.fetchrow(
+                '''
+                UPDATE conversation_turns AS turn
+                SET status = 'running', attempt = attempt + 1,
+                    worker_token = $4, started_at = clock_timestamp(),
+                    lease_expires_at = clock_timestamp() + $5 * INTERVAL '1 second'
+                WHERE turn.turn_id = $1 AND turn.tenant_id = $2
+                  AND turn.status = 'queued'
+                  AND EXISTS (
+                    SELECT 1 FROM conversations AS conversation
+                    WHERE conversation.conversation_id = turn.conversation_id
+                      AND conversation.tenant_id = turn.tenant_id
+                      AND conversation.owner_subject_id = $3
+                  )
+                RETURNING turn.*
+                ''',
+                turn_id, principal.tenant_id, principal.subject_id, token, lease_seconds,
+            )
+            if row is None:
+                raise ConversationCoordinatorError("turn unavailable")
+            await write_event(
+                connection,
+                tenant_id=principal.tenant_id,
+                event_type="governance.conversation.turn.running",
+                correlation_id=row["correlation_id"],
+                payload={
+                    "turn_id": str(row["turn_id"]),
+                    "conversation_id": str(row["conversation_id"]),
+                    "attempt": row["attempt"],
+                },
+            )
+            return dict(row)
+
+
+async def cancel_turn(pool, principal, turn_id, *, write_event):
+    return await _finish_turn(
+        pool, principal, turn_id, status="cancelled", write_event=write_event,
+    )
+
+
+async def fail_turn(
+    pool, principal, turn_id, *, worker_token, error_code, write_event,
+):
+    if worker_token is None:
+        raise ConversationCoordinatorError("worker token required")
+    if (
+        not isinstance(error_code, str)
+        or not error_code.strip()
+        or len(error_code) > 128
+    ):
+        raise ConversationCoordinatorError("error code must contain 1 to 128 characters")
+    return await _finish_turn(
+        pool, principal, turn_id, status="failed", write_event=write_event,
+        worker_token=worker_token, error_code=error_code.strip(),
+    )
+
+
+async def _finish_turn(
+    pool, principal, turn_id, *, status, write_event,
+    worker_token=None, error_code=None,
+):
+    required = {"conversations:read", "conversations:write"}
+    if not required.issubset(principal.permissions):
+        raise ConversationCoordinatorError("permission denied")
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            existing = await connection.fetchrow(
+                """
+                SELECT turn.*
+                FROM conversation_turns AS turn
+                JOIN conversations AS conversation
+                  ON conversation.tenant_id = turn.tenant_id
+                 AND conversation.conversation_id = turn.conversation_id
+                WHERE turn.turn_id = $1 AND turn.tenant_id = $2
+                  AND conversation.owner_subject_id = $3
+                FOR UPDATE OF turn
+                """,
+                turn_id, principal.tenant_id, principal.subject_id,
+            )
+            if existing is None:
+                raise ConversationCoordinatorError("turn unavailable")
+            row = await connection.fetchrow(
+                """
+                UPDATE conversation_turns
+                SET status = $3, completed_at = clock_timestamp(),
+                    worker_token = NULL, lease_expires_at = NULL,
+                    error_code = $5
+                WHERE turn_id = $1 AND tenant_id = $2
+                  AND (
+                    ($3 = 'cancelled' AND status IN ('queued', 'running'))
+                    OR
+                    ($3 = 'failed' AND status = 'running'
+                      AND worker_token = $4
+                      AND lease_expires_at > clock_timestamp())
+                  )
+                RETURNING *
+                """,
+                turn_id, principal.tenant_id, status, worker_token, error_code,
+            )
+            if row is None:
+                raise ConversationCoordinatorError("turn unavailable")
+            await write_event(
+                connection,
+                tenant_id=principal.tenant_id,
+                event_type="governance.conversation.turn." + status,
+                correlation_id=row["correlation_id"],
+                payload={
+                    "turn_id": str(row["turn_id"]),
+                    "conversation_id": str(row["conversation_id"]),
+                    "attempt": row["attempt"],
+                    **({"error_code": error_code} if status == "failed" else {}),
+                },
+            )
+            return dict(row)
+
+
+async def publish_turn(
+    pool, principal, turn_id, *, worker_token, content, write_event,
+):
+    required = {"conversations:read", "conversations:write"}
+    if not required.issubset(principal.permissions):
+        raise ConversationCoordinatorError("permission denied")
+    if worker_token is None:
+        raise ConversationCoordinatorError("worker token required")
+    if not isinstance(content, str) or not content.strip():
+        raise ConversationCoordinatorError("assistant content must not be blank")
+
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            turn = await connection.fetchrow(
+                """
+                SELECT turn.*
+                FROM conversation_turns AS turn
+                JOIN conversations AS conversation
+                  ON conversation.tenant_id = turn.tenant_id
+                 AND conversation.conversation_id = turn.conversation_id
+                WHERE turn.turn_id = $1 AND turn.tenant_id = $2
+                  AND conversation.owner_subject_id = $3
+                  AND turn.status = 'running'
+                  AND turn.worker_token = $4
+                  AND turn.lease_expires_at > clock_timestamp()
+                FOR UPDATE OF turn
+                """,
+                turn_id, principal.tenant_id, principal.subject_id, worker_token,
+            )
+            if turn is None:
+                raise ConversationCoordinatorError("turn unavailable")
+            conversation = await connection.fetchrow(
+                """
+                SELECT conversation_id FROM conversations
+                WHERE conversation_id = $1 AND tenant_id = $2
+                  AND owner_subject_id = $3
+                FOR UPDATE
+                """,
+                turn["conversation_id"], principal.tenant_id, principal.subject_id,
+            )
+            if conversation is None:
+                raise ConversationCoordinatorError("turn unavailable")
+            user_role = await connection.fetchval(
+                """
+                SELECT role FROM conversation_messages
+                WHERE message_id = $1 AND tenant_id = $2
+                  AND conversation_id = $3
+                """,
+                turn["user_message_id"], principal.tenant_id,
+                turn["conversation_id"],
+            )
+            if user_role != "user":
+                raise ConversationCoordinatorError("turn source must be a user message")
+
+            message = await connection.fetchrow(
+                """
+                INSERT INTO conversation_messages (
+                    message_id, tenant_id, conversation_id,
+                    sequence_number, role, content
+                )
+                SELECT $1, $2, $3, COALESCE(MAX(sequence_number), 0) + 1,
+                       'assistant', $4
+                FROM conversation_messages
+                WHERE conversation_id = $3 AND tenant_id = $2
+                RETURNING message_id, conversation_id, sequence_number,
+                          role, content, client_message_id, created_at
+                """,
+                uuid4(), principal.tenant_id, turn["conversation_id"], content,
+            )
+            completed = await connection.fetchrow(
+                """
+                UPDATE conversation_turns
+                SET status = 'completed', assistant_message_id = $4,
+                    completed_at = clock_timestamp(),
+                    worker_token = NULL, lease_expires_at = NULL
+                WHERE turn_id = $1 AND tenant_id = $2
+                  AND status = 'running' AND worker_token = $3
+                  AND lease_expires_at > clock_timestamp()
+                RETURNING *
+                """,
+                turn_id, principal.tenant_id, worker_token, message["message_id"],
+            )
+            if completed is None:
+                raise ConversationCoordinatorError("turn unavailable")
+            await connection.execute(
+                """
+                UPDATE conversations SET updated_at = clock_timestamp()
+                WHERE conversation_id = $1 AND tenant_id = $2
+                  AND owner_subject_id = $3
+                """,
+                turn["conversation_id"], principal.tenant_id, principal.subject_id,
+            )
+            await write_event(
+                connection,
+                tenant_id=principal.tenant_id,
+                event_type="governance.conversation.turn.completed",
+                correlation_id=turn["correlation_id"],
+                payload={
+                    "turn_id": str(turn_id),
+                    "conversation_id": str(turn["conversation_id"]),
+                    "assistant_message_id": str(message["message_id"]),
+                    "attempt": completed["attempt"],
+                },
+            )
+            return {"turn": dict(completed), "message": dict(message)}
+
+
+def context_digest(messages):
+    import hashlib
+    import json
+
+    snapshot = [
+        [str(row["message_id"]), row["sequence_number"], row["role"], row["content"]]
+        for row in messages
+    ]
+    encoded = json.dumps(
+        snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+async def reserve_turn(
+    pool, principal, conversation_id, user_message_id, *, write_event,
+):
+    required = {"conversations:read", "conversations:write"}
+    if not required.issubset(principal.permissions):
+        raise ConversationCoordinatorError("permission denied")
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            conversation = await connection.fetchrow(
+                """
+                SELECT conversation_id FROM conversations
+                WHERE conversation_id = $1 AND tenant_id = $2
+                  AND owner_subject_id = $3
+                FOR UPDATE
+                """,
+                conversation_id, principal.tenant_id, principal.subject_id,
+            )
+            if conversation is None:
+                raise ConversationCoordinatorError("conversation unavailable")
+            user = await connection.fetchrow(
+                """
+                SELECT role, sequence_number FROM conversation_messages
+                WHERE message_id = $1 AND tenant_id = $2
+                  AND conversation_id = $3
+                """,
+                user_message_id, principal.tenant_id, conversation_id,
+            )
+            if user is None or user["role"] != "user":
+                raise ConversationCoordinatorError("user message unavailable")
+            existing = await connection.fetchrow(
+                """
+                SELECT * FROM conversation_turns
+                WHERE tenant_id = $1 AND conversation_id = $2
+                  AND user_message_id = $3
+                """,
+                principal.tenant_id, conversation_id, user_message_id,
+            )
+            if existing is not None:
+                return dict(existing)
+            active = await connection.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM conversation_turns
+                    WHERE tenant_id = $1 AND conversation_id = $2
+                      AND status IN ('queued', 'running')
+                )
+                """,
+                principal.tenant_id, conversation_id,
+            )
+            if active:
+                raise ConversationCoordinatorError("conversation has an active turn")
+            messages = await connection.fetch(
+                """
+                SELECT message_id, sequence_number, role, content
+                FROM conversation_messages
+                WHERE tenant_id = $1 AND conversation_id = $2
+                  AND sequence_number <= $3
+                ORDER BY sequence_number, message_id
+                """,
+                principal.tenant_id, conversation_id, user["sequence_number"],
+            )
+            turn_id = uuid4()
+            row = await connection.fetchrow(
+                """
+                INSERT INTO conversation_turns (
+                    turn_id, tenant_id, conversation_id, user_message_id,
+                    correlation_id, context_sequence_number, context_sha256, status
+                )
+                VALUES ($1, $2, $3, $4, $1, $5, $6, 'queued')
+                RETURNING *
+                """,
+                turn_id, principal.tenant_id, conversation_id, user_message_id,
+                user["sequence_number"], context_digest(messages),
+            )
+            await write_event(
+                connection,
+                tenant_id=principal.tenant_id,
+                event_type="governance.conversation.turn.queued",
+                correlation_id=row["correlation_id"],
+                payload={
+                    "turn_id": str(turn_id),
+                    "conversation_id": str(conversation_id),
+                    "user_message_id": str(user_message_id),
+                    "context_sequence_number": row["context_sequence_number"],
+                    "context_sha256": row["context_sha256"],
+                },
+            )
+            return dict(row)
+
+
+async def _load_turn_context(pool, principal, turn_id, worker_token):
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            turn = await connection.fetchrow(
+                """
+                SELECT turn.*
+                FROM conversation_turns AS turn
+                JOIN conversations AS conversation
+                  ON conversation.tenant_id = turn.tenant_id
+                 AND conversation.conversation_id = turn.conversation_id
+                WHERE turn.turn_id = $1 AND turn.tenant_id = $2
+                  AND conversation.owner_subject_id = $3
+                  AND turn.status = 'running' AND turn.worker_token = $4
+                  AND turn.lease_expires_at > clock_timestamp()
+                """,
+                turn_id, principal.tenant_id, principal.subject_id, worker_token,
+            )
+            if turn is None:
+                raise ConversationCoordinatorError("turn unavailable")
+            messages = await connection.fetch(
+                """
+                SELECT message_id, sequence_number, role, content
+                FROM conversation_messages
+                WHERE tenant_id = $1 AND conversation_id = $2
+                  AND sequence_number <= $3
+                ORDER BY sequence_number, message_id
+                """,
+                principal.tenant_id, turn["conversation_id"],
+                turn["context_sequence_number"],
+            )
+            if (
+                not messages
+                or messages[-1]["message_id"] != turn["user_message_id"]
+                or messages[-1]["role"] != "user"
+                or messages[-1]["sequence_number"] != turn["context_sequence_number"]
+                or context_digest(messages) != turn["context_sha256"]
+            ):
+                raise ConversationCoordinatorError("turn context mismatch")
+            remaining = await connection.fetchval(
+                """
+                SELECT EXTRACT(EPOCH FROM lease_expires_at - clock_timestamp())
+                FROM conversation_turns
+                WHERE turn_id = $1 AND tenant_id = $2
+                  AND status = 'running' AND worker_token = $3
+                """,
+                turn_id, principal.tenant_id, worker_token,
+            )
+            if remaining is None or remaining <= 0:
+                raise ConversationCoordinatorError("turn unavailable")
+            return list(messages), float(remaining)
+
+
+async def execute_turn(
+    pool, principal, conversation_id, user_message_id, *,
+    model, write_event, lease_seconds=90,
+):
+    import asyncio
+    from app.conversation_adapters import ConversationTurn
+
+    reserved = await reserve_turn(
+        pool, principal, conversation_id, user_message_id, write_event=write_event,
+    )
+    if reserved["status"] == "completed":
+        async with pool.acquire() as connection:
+            message = await connection.fetchrow(
+                """
+                SELECT message_id, conversation_id, sequence_number,
+                       role, content, client_message_id, created_at
+                FROM conversation_messages
+                WHERE tenant_id = $1 AND conversation_id = $2
+                  AND message_id = $3 AND role = 'assistant'
+                """,
+                principal.tenant_id, conversation_id,
+                reserved["assistant_message_id"],
+            )
+            if message is None:
+                raise ConversationCoordinatorError("completed result unavailable")
+            return {"turn": reserved, "message": dict(message)}
+    if reserved["status"] in {"failed", "cancelled"}:
+        raise ConversationCoordinatorError("turn is terminal")
+    claimed = await claim_turn(
+        pool, principal, reserved["turn_id"],
+        write_event=write_event, lease_seconds=lease_seconds,
+    )
+    turn_id = claimed["turn_id"]
+    token = claimed["worker_token"]
+    try:
+        rows, remaining = await _load_turn_context(pool, principal, turn_id, token)
+        context = [ConversationTurn(row["role"], row["content"]) for row in rows]
+        content = await asyncio.wait_for(model.complete(context), timeout=remaining)
+        return await publish_turn(
+            pool, principal, turn_id, worker_token=token,
+            content=content, write_event=write_event,
+        )
+    except Exception as error:
+        code = "execution_timeout" if isinstance(error, TimeoutError) else "execution_failed"
+        try:
+            await fail_turn(
+                pool, principal, turn_id, worker_token=token,
+                error_code=code, write_event=write_event,
+            )
+        except Exception as finalization_error:
+            error.add_note(
+                "Failure finalization did not succeed: "
+                + type(finalization_error).__name__
+            )
+        raise
+
+
+async def expire_conversation_turns(
+    pool, principal, conversation_id, *, write_event,
+):
+    if "conversations:read" not in principal.permissions:
+        raise ConversationCoordinatorError("permission denied")
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            rows = await connection.fetch(
+                """
+                UPDATE conversation_turns AS turn
+                SET status = 'failed', error_code = 'lease_expired',
+                    completed_at = clock_timestamp(),
+                    worker_token = NULL, lease_expires_at = NULL
+                WHERE turn.tenant_id = $1 AND turn.conversation_id = $2
+                  AND turn.status = 'running'
+                  AND turn.lease_expires_at <= clock_timestamp()
+                  AND EXISTS (
+                    SELECT 1 FROM conversations AS conversation
+                    WHERE conversation.tenant_id = turn.tenant_id
+                      AND conversation.conversation_id = turn.conversation_id
+                      AND conversation.owner_subject_id = $3
+                  )
+                RETURNING turn.*
+                """,
+                principal.tenant_id, conversation_id, principal.subject_id,
+            )
+            for row in rows:
+                await write_event(
+                    connection,
+                    tenant_id=principal.tenant_id,
+                    event_type="governance.conversation.turn.failed",
+                    correlation_id=row["correlation_id"],
+                    payload={
+                        "turn_id": str(row["turn_id"]),
+                        "conversation_id": str(conversation_id),
+                        "attempt": row["attempt"],
+                        "error_code": "lease_expired",
+                    },
+                )
+            return [dict(row) for row in rows]
