@@ -178,6 +178,58 @@ JOB_STATUSES = {
 }
 
 
+class ConversationCreate(BaseModel):
+    title: str | None = Field(default=None, max_length=500)
+    correlation_id: UUID | None = None
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class ConversationMessageCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=20000)
+    client_message_id: UUID | None = None
+
+    @field_validator("content")
+    @classmethod
+    def normalize_content(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("content must not be blank")
+        return value
+
+
+def serialize_conversation(row) -> dict:
+    return {
+        "conversation_id": str(row["conversation_id"]),
+        "title": row["title"],
+        "correlation_id": str(row["correlation_id"]),
+        "created_at": serialize_datetime(row["created_at"]),
+        "updated_at": serialize_datetime(row["updated_at"]),
+    }
+
+
+def serialize_conversation_message(row) -> dict:
+    return {
+        "message_id": str(row["message_id"]),
+        "conversation_id": str(row["conversation_id"]),
+        "sequence_number": row["sequence_number"],
+        "role": row["role"],
+        "content": row["content"],
+        "client_message_id": (
+            str(row["client_message_id"])
+            if row["client_message_id"] is not None
+            else None
+        ),
+        "created_at": serialize_datetime(row["created_at"]),
+    }
+
+
 class JobCreate(BaseModel):
     evidence_id: UUID | None = None
     job_type: str = Field(min_length=3, max_length=255)
@@ -336,6 +388,271 @@ async def readyz():
         "timestamp_utc": timestamp_utc(),
         "database": "reachable",
     }
+
+
+@app.post("/conversations", status_code=status.HTTP_201_CREATED)
+async def create_conversation(
+    conversation: ConversationCreate,
+    principal: Principal = Depends(require_permission("conversations:create")),
+) -> dict:
+    conversation_id = uuid4()
+    correlation_id = conversation.correlation_id or uuid4()
+
+    try:
+        async with app.state.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                INSERT INTO conversations (
+                  conversation_id, tenant_id, owner_subject_id, title, correlation_id
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING conversation_id, title, correlation_id, created_at, updated_at
+                """,
+                conversation_id,
+                principal.tenant_id,
+                principal.subject_id,
+                conversation.title,
+                correlation_id,
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database write failed",
+        ) from exc
+
+    return serialize_conversation(row)
+
+
+@app.get("/conversations")
+async def list_conversations(
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(require_permission("conversations:read")),
+) -> dict:
+    try:
+        async with app.state.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT conversation_id, title, correlation_id, created_at, updated_at
+                FROM conversations
+                WHERE tenant_id = $1 AND owner_subject_id = $2
+                ORDER BY updated_at DESC, conversation_id DESC
+                LIMIT $3 OFFSET $4
+                """,
+                principal.tenant_id,
+                principal.subject_id,
+                limit,
+                offset,
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database query failed",
+        ) from exc
+
+    return {
+        "limit": limit,
+        "offset": offset,
+        "items": [serialize_conversation(row) for row in rows],
+    }
+
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversation(
+    conversation_id: UUID,
+    principal: Principal = Depends(require_permission("conversations:read")),
+) -> dict:
+    try:
+        async with app.state.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT conversation_id, title, correlation_id, created_at, updated_at
+                FROM conversations
+                WHERE conversation_id = $1
+                  AND tenant_id = $2
+                  AND owner_subject_id = $3
+                """,
+                conversation_id,
+                principal.tenant_id,
+                principal.subject_id,
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database query failed",
+        ) from exc
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="conversation not found",
+        )
+
+    return serialize_conversation(row)
+
+
+@app.get("/conversations/{conversation_id}/messages")
+async def list_conversation_messages(
+    conversation_id: UUID,
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(require_permission("conversations:read")),
+) -> dict:
+    try:
+        async with app.state.pool.acquire() as connection:
+            conversation = await connection.fetchrow(
+                """
+                SELECT conversation_id
+                FROM conversations
+                WHERE conversation_id = $1
+                  AND tenant_id = $2
+                  AND owner_subject_id = $3
+                """,
+                conversation_id,
+                principal.tenant_id,
+                principal.subject_id,
+            )
+            if conversation is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="conversation not found",
+                )
+
+            rows = await connection.fetch(
+                """
+                SELECT
+                  message_id, conversation_id, sequence_number, role, content,
+                  client_message_id, created_at
+                FROM conversation_messages
+                WHERE conversation_id = $1 AND tenant_id = $2
+                ORDER BY sequence_number ASC, message_id ASC
+                LIMIT $3 OFFSET $4
+                """,
+                conversation_id,
+                principal.tenant_id,
+                limit,
+                offset,
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database query failed",
+        ) from exc
+
+    return {
+        "conversation_id": str(conversation_id),
+        "limit": limit,
+        "offset": offset,
+        "items": [serialize_conversation_message(row) for row in rows],
+    }
+
+
+@app.post(
+    "/conversations/{conversation_id}/messages",
+    status_code=status.HTTP_201_CREATED,
+)
+async def append_conversation_message(
+    conversation_id: UUID,
+    message: ConversationMessageCreate,
+    principal: Principal = Depends(require_permission("conversations:write")),
+) -> dict:
+    message_id = uuid4()
+
+    try:
+        async with app.state.pool.acquire() as connection:
+            async with connection.transaction():
+                conversation = await connection.fetchrow(
+                    """
+                    SELECT conversation_id
+                    FROM conversations
+                    WHERE conversation_id = $1
+                      AND tenant_id = $2
+                      AND owner_subject_id = $3
+                    FOR UPDATE
+                    """,
+                    conversation_id,
+                    principal.tenant_id,
+                    principal.subject_id,
+                )
+                if conversation is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="conversation not found",
+                    )
+
+                if message.client_message_id is not None:
+                    existing = await connection.fetchrow(
+                        """
+                        SELECT
+                          message_id, conversation_id, sequence_number, role, content,
+                          client_message_id, created_at
+                        FROM conversation_messages
+                        WHERE conversation_id = $1
+                          AND tenant_id = $2
+                          AND client_message_id = $3
+                        """,
+                        conversation_id,
+                        principal.tenant_id,
+                        message.client_message_id,
+                    )
+                    if existing is not None:
+                        if (
+                            existing["role"] != "user"
+                            or existing["content"] != message.content
+                        ):
+                            raise HTTPException(
+                                status_code=status.HTTP_409_CONFLICT,
+                                detail=(
+                                    "client_message_id is already used for different content"
+                                ),
+                            )
+                        return serialize_conversation_message(existing)
+
+                inserted = await connection.fetchrow(
+                    """
+                    INSERT INTO conversation_messages (
+                      message_id, tenant_id, conversation_id, sequence_number,
+                      role, content, client_message_id
+                    )
+                    SELECT
+                      $1, $2, $3,
+                      COALESCE(MAX(sequence_number), 0) + 1,
+                      'user', $4, $5
+                    FROM conversation_messages
+                    WHERE conversation_id = $3 AND tenant_id = $2
+                    RETURNING
+                      message_id, conversation_id, sequence_number, role, content,
+                      client_message_id, created_at
+                    """,
+                    message_id,
+                    principal.tenant_id,
+                    conversation_id,
+                    message.content,
+                    message.client_message_id,
+                )
+                await connection.execute(
+                    """
+                    UPDATE conversations
+                    SET updated_at = NOW()
+                    WHERE conversation_id = $1
+                      AND tenant_id = $2
+                      AND owner_subject_id = $3
+                    """,
+                    conversation_id,
+                    principal.tenant_id,
+                    principal.subject_id,
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database write failed",
+        ) from exc
+
+    return serialize_conversation_message(inserted)
 
 
 @app.post("/intake-items", status_code=status.HTTP_201_CREATED)
