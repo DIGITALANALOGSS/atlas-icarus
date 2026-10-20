@@ -49,6 +49,17 @@ services:
       target: test
     profiles:
       - test
+    working_dir: /review/services/atlas-control
+    volumes:
+      - type: bind
+        source: .
+        target: /review
+        read_only: true
+    environment:
+      ATLAS_CONVERSATION_MODEL: echo
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: /review/services/atlas-control:/review/apps/atlas-workspace
+    command: python -B -m pytest -q -p no:cacheprovider tests
 
   postgres-test:
     profiles: ["integration"]
@@ -73,9 +84,18 @@ services:
     depends_on:
       postgres-test:
         condition: service_healthy
+    working_dir: /review/services/atlas-control
+    volumes:
+      - type: bind
+        source: .
+        target: /review
+        read_only: true
     environment:
       DATABASE_URL: postgresql://atlas_test:atlas_test_password@postgres-test:5432/atlas_test
-    command: pytest -q tests/integration
+      ATLAS_CONVERSATION_MODEL: echo
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: /review/services/atlas-control:/review/apps/atlas-workspace
+    command: python -B -m pytest -q -ra -p no:cacheprovider tests/integration
 
 volumes:
   postgres_data:

@@ -22,7 +22,7 @@ test:
 >@$(COMPOSE) --profile test run --rm --build atlas-control-tests
 
 integration:
->@$(COMPOSE) --profile integration run --rm --build atlas-control-integration-tests
+>@$(COMPOSE) --profile integration run --rm -T --build atlas-control-integration-tests
 
 smoke:
 >@$(PYTHON) scripts/smoke_evidence_workflow.py
