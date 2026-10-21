@@ -1,0 +1,11 @@
+{
+  "services": {
+    "atlas-control": {
+      "image": "atlas-control-memory:20261019T025703Z",
+      "environment": {
+        "ATLAS_ACCEPTED_MEMORY_RECALL": "1",
+        "ATLAS_MEMORY_LIFECYCLE_ENFORCEMENT": "0"
+      }
+    }
+  }
+}

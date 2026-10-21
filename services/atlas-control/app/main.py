@@ -1842,3 +1842,13 @@ from app.conversation_turn_routes import (
 )
 
 register_conversation_turn_routes(app, write_event)
+
+from app.conversation_memory_review_routes import (
+    register_conversation_memory_review_routes,
+)
+
+register_conversation_memory_review_routes(app, write_event)
+
+# atlas-voice-stream-routes-v1
+from app.conversation_voice_stream import register_voice_stream_routes
+register_voice_stream_routes(app, write_event)

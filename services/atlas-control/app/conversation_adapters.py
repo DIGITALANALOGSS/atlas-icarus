@@ -1,3 +1,4 @@
+# atlas-model-streaming-v1
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +23,12 @@ class ConversationModel(Protocol):
         """Return the assistant reply for the supplied ordered conversation."""
 
 
+    async def stream(self, messages):
+        """Yield assistant text fragments; callers must close on interruption."""
+        ...
+
+
+
 class EchoConversationModel:
     """Deterministic local implementation used until a model provider is configured."""
 
@@ -30,6 +37,12 @@ class EchoConversationModel:
             if message.role == "user":
                 return f"Atlas received: {message.content}"
         return "Atlas is ready."
+
+
+    async def stream(self, messages):
+        """Streaming-compatible deterministic implementation."""
+        yield await self.complete(messages)
+
 
 
 class ConversationModelError(RuntimeError):
@@ -148,3 +161,13 @@ class LlamaCppConversationModel:
             raise ConversationModelError("model response content was blank")
 
         return content.strip()
+
+
+    async def stream(self, messages):
+        """Yield live text fragments without waiting for the full answer."""
+        from contextlib import aclosing
+        from app.conversation_streaming import stream_completion
+
+        async with aclosing(stream_completion(self, messages)) as fragments:
+            async for fragment in fragments:
+                yield fragment

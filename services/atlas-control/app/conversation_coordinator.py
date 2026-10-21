@@ -1,10 +1,39 @@
+import json
+from app.conversation_memory import (
+    memory_context_digest, stored_memory_context,
+)
+
 from uuid import uuid4
 
 from app.auth import Principal
+from app.conversation_memory_lifecycle import (
+    MemoryLifecycleError, lifecycle_enabled, execution_lock,
+    validate_turn_dependencies, snapshot_records, dependency_digest,
+)
+from app.conversation_memory_recall import (
+    accepted_memory_recall_enabled,
+    select_accepted_memories,
+    merge_memory_context,
+)
+from app.conversation_workspace_bindings import (
+    WorkspaceBindingError, ensure_workspace_binding,
+)
+
+WORKSPACE_UNSPECIFIED = object()
 
 
 class ConversationCoordinatorError(RuntimeError):
     pass
+
+
+async def _memory_lifecycle_gate(connection, principal, turn):
+    try:
+        await validate_turn_dependencies(connection, principal, turn)
+    except (MemoryLifecycleError, ValueError, TypeError, KeyError) as exc:
+        raise ConversationCoordinatorError(
+            "turn memory withdrawn, changed, or provenance unavailable"
+        ) from exc
+
 
 
 async def claim_turn(pool, principal: Principal, turn_id, *, write_event, lease_seconds=90):
@@ -16,6 +45,7 @@ async def claim_turn(pool, principal: Principal, turn_id, *, write_event, lease_
     token = uuid4()
     async with pool.acquire() as connection:
         async with connection.transaction():
+            await execution_lock(connection, principal)
             row = await connection.fetchrow(
                 '''
                 UPDATE conversation_turns AS turn
@@ -36,6 +66,7 @@ async def claim_turn(pool, principal: Principal, turn_id, *, write_event, lease_
             )
             if row is None:
                 raise ConversationCoordinatorError("turn unavailable")
+            await _memory_lifecycle_gate(connection, principal, dict(row))
             await write_event(
                 connection,
                 tenant_id=principal.tenant_id,
@@ -145,6 +176,7 @@ async def publish_turn(
 
     async with pool.acquire() as connection:
         async with connection.transaction():
+            await execution_lock(connection, principal)
             turn = await connection.fetchrow(
                 """
                 SELECT turn.*
@@ -163,6 +195,7 @@ async def publish_turn(
             )
             if turn is None:
                 raise ConversationCoordinatorError("turn unavailable")
+            await _memory_lifecycle_gate(connection, principal, dict(turn))
             conversation = await connection.fetchrow(
                 """
                 SELECT conversation_id FROM conversations
@@ -216,6 +249,20 @@ async def publish_turn(
             )
             if completed is None:
                 raise ConversationCoordinatorError("turn unavailable")
+            # Queue source learning in the publication transaction.
+            await connection.execute(
+                """
+                INSERT INTO conversation_learning_jobs (
+                    job_id, tenant_id, conversation_id, source_message_id
+                )
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (
+                    tenant_id, conversation_id, source_message_id
+                ) DO NOTHING
+                """,
+                uuid4(), principal.tenant_id,
+                turn["conversation_id"], turn["user_message_id"],
+            )
             await connection.execute(
                 """
                 UPDATE conversations SET updated_at = clock_timestamp()
@@ -255,12 +302,24 @@ def context_digest(messages):
 
 async def reserve_turn(
     pool, principal, conversation_id, user_message_id, *, write_event,
+    memory_context=(), workspace_project_id=WORKSPACE_UNSPECIFIED,
 ):
     required = {"conversations:read", "conversations:write"}
     if not required.issubset(principal.permissions):
         raise ConversationCoordinatorError("permission denied")
+    memory_context_digest(memory_context)
+    selected_memory = list(memory_context)
+    memory_sha256 = memory_context_digest(selected_memory)
+    recall_enabled = accepted_memory_recall_enabled()
+    enforce_lifecycle = lifecycle_enabled()
+    if enforce_lifecycle and not recall_enabled:
+        raise ConversationCoordinatorError(
+            "lifecycle enforcement requires accepted-memory recall"
+        )
+    dependencies = None
     async with pool.acquire() as connection:
         async with connection.transaction():
+            await execution_lock(connection, principal)
             conversation = await connection.fetchrow(
                 """
                 SELECT conversation_id FROM conversations
@@ -282,6 +341,14 @@ async def reserve_turn(
             )
             if user is None or user["role"] != "user":
                 raise ConversationCoordinatorError("user message unavailable")
+            if workspace_project_id is not WORKSPACE_UNSPECIFIED:
+                try:
+                    await ensure_workspace_binding(
+                        connection, principal, conversation_id,
+                        workspace_project_id, write_event=write_event,
+                    )
+                except WorkspaceBindingError as exc:
+                    raise ConversationCoordinatorError(str(exc)) from exc
             existing = await connection.fetchrow(
                 """
                 SELECT * FROM conversation_turns
@@ -291,6 +358,23 @@ async def reserve_turn(
                 principal.tenant_id, conversation_id, user_message_id,
             )
             if existing is not None:
+                if existing['status'] not in {
+                    'completed', 'failed', 'cancelled'
+                }:
+                    try:
+                        saved = stored_memory_context(existing)
+                        await _memory_lifecycle_gate(
+                            connection, principal, dict(existing),
+                        )
+                        if (
+                            not recall_enabled
+                            and memory_context_digest(saved) != memory_sha256
+                        ):
+                            raise ValueError('memory selection changed')
+                    except (ValueError, TypeError) as exc:
+                        raise ConversationCoordinatorError(
+                            'turn memory context unavailable or changed'
+                        ) from exc
                 return dict(existing)
             active = await connection.fetchval(
                 """
@@ -304,6 +388,25 @@ async def reserve_turn(
             )
             if active:
                 raise ConversationCoordinatorError("conversation has an active turn")
+            if enforce_lifecycle:
+                if selected_memory:
+                    raise ConversationCoordinatorError(
+                        "untracked saved context is not allowed in lifecycle enforcement mode"
+                    )
+                records = await select_accepted_memories(
+                    connection, principal, conversation_id,
+                    with_provenance=True,
+                )
+                selected_memory, dependencies = snapshot_records(records)
+                memory_sha256 = memory_context_digest(selected_memory)
+            elif recall_enabled:
+                recalled = await select_accepted_memories(
+                    connection, principal, conversation_id,
+                )
+                selected_memory = merge_memory_context(
+                    recalled, selected_memory,
+                )
+                memory_sha256 = memory_context_digest(selected_memory)
             messages = await connection.fetch(
                 """
                 SELECT message_id, sequence_number, role, content
@@ -319,14 +422,32 @@ async def reserve_turn(
                 """
                 INSERT INTO conversation_turns (
                     turn_id, tenant_id, conversation_id, user_message_id,
-                    correlation_id, context_sequence_number, context_sha256, status
+                    correlation_id, context_sequence_number, context_sha256,
+                    memory_context, memory_context_sha256, status
                 )
-                VALUES ($1, $2, $3, $4, $1, $5, $6, 'queued')
+                VALUES ($1, $2, $3, $4, $1, $5, $6, $7::jsonb, $8, 'queued')
                 RETURNING *
                 """,
                 turn_id, principal.tenant_id, conversation_id, user_message_id,
                 user["sequence_number"], context_digest(messages),
+                json.dumps(selected_memory, ensure_ascii=False),
+                memory_sha256,
             )
+            if dependencies is not None:
+                row = await connection.fetchrow(
+                    """
+                    UPDATE conversation_turns
+                    SET memory_dependencies=$3::jsonb,
+                        memory_dependencies_sha256=$4
+                    WHERE turn_id=$1 AND tenant_id=$2
+                    RETURNING *
+                    """,
+                    turn_id, principal.tenant_id,
+                    json.dumps(dependencies),
+                    dependency_digest(dependencies),
+                )
+                if row is None:
+                    raise ConversationCoordinatorError("turn unavailable")
             await write_event(
                 connection,
                 tenant_id=principal.tenant_id,
@@ -338,14 +459,20 @@ async def reserve_turn(
                     "user_message_id": str(user_message_id),
                     "context_sequence_number": row["context_sequence_number"],
                     "context_sha256": row["context_sha256"],
+                    "memory_context_sha256": memory_sha256,
+                    "memory_count": len(selected_memory),
                 },
             )
             return dict(row)
 
 
-async def _load_turn_context(pool, principal, turn_id, worker_token):
+async def _load_turn_context(
+    pool, principal, turn_id, worker_token, *,
+    expected_memory_sha256=None,
+):
     async with pool.acquire() as connection:
         async with connection.transaction():
+            await execution_lock(connection, principal)
             turn = await connection.fetchrow(
                 """
                 SELECT turn.*
@@ -362,6 +489,18 @@ async def _load_turn_context(pool, principal, turn_id, worker_token):
             )
             if turn is None:
                 raise ConversationCoordinatorError("turn unavailable")
+            await _memory_lifecycle_gate(connection, principal, dict(turn))
+            try:
+                stored_memory_context(turn)
+                if (
+                    expected_memory_sha256 is not None
+                    and turn["memory_context_sha256"] != expected_memory_sha256
+                ):
+                    raise ValueError("memory selection changed")
+            except (ValueError, TypeError) as exc:
+                raise ConversationCoordinatorError(
+                    "turn memory context unavailable or changed"
+                ) from exc
             messages = await connection.fetch(
                 """
                 SELECT message_id, sequence_number, role, content
@@ -397,13 +536,22 @@ async def _load_turn_context(pool, principal, turn_id, worker_token):
 
 async def execute_turn(
     pool, principal, conversation_id, user_message_id, *,
-    model, write_event, lease_seconds=90,
+    model, write_event, lease_seconds=90, memory_context=(),
+    workspace_project_id=WORKSPACE_UNSPECIFIED,
 ):
     import asyncio
     from app.conversation_adapters import ConversationTurn
+    from app.conversation_memory import memory_system_message
 
+    memory_system_message(memory_context)
+    selected_memory = list(memory_context)
+
+    workspace_options = {}
+    if workspace_project_id is not WORKSPACE_UNSPECIFIED:
+        workspace_options["workspace_project_id"] = workspace_project_id
     reserved = await reserve_turn(
         pool, principal, conversation_id, user_message_id, write_event=write_event,
+        memory_context=selected_memory, **workspace_options,
     )
     if reserved["status"] == "completed":
         async with pool.acquire() as connection:
@@ -423,6 +571,12 @@ async def execute_turn(
             return {"turn": reserved, "message": dict(message)}
     if reserved["status"] in {"failed", "cancelled"}:
         raise ConversationCoordinatorError("turn is terminal")
+    try:
+        memory_prompt = memory_system_message(stored_memory_context(reserved))
+    except (ValueError, TypeError) as exc:
+        raise ConversationCoordinatorError(
+            "turn memory context unavailable or changed"
+        ) from exc
     claimed = await claim_turn(
         pool, principal, reserved["turn_id"],
         write_event=write_event, lease_seconds=lease_seconds,
@@ -430,8 +584,13 @@ async def execute_turn(
     turn_id = claimed["turn_id"]
     token = claimed["worker_token"]
     try:
-        rows, remaining = await _load_turn_context(pool, principal, turn_id, token)
+        rows, remaining = await _load_turn_context(
+            pool, principal, turn_id, token,
+            expected_memory_sha256=reserved['memory_context_sha256'],
+        )
         context = [ConversationTurn(row["role"], row["content"]) for row in rows]
+        if memory_prompt is not None:
+            context.insert(0, ConversationTurn("system", memory_prompt))
         content = await asyncio.wait_for(model.complete(context), timeout=remaining)
         return await publish_turn(
             pool, principal, turn_id, worker_token=token,

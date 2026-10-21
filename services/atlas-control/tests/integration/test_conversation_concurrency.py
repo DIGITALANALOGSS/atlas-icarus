@@ -46,6 +46,8 @@ async def conversation_case(monkeypatch):
             async with pool.acquire() as connection:
                 async with connection.transaction():
                     for table in (
+                        "conversation_memory_proposals",
+                        "conversation_learning_jobs",
                         "conversation_turns", "conversation_messages", "conversations",
                     ):
                         await connection.execute(
@@ -377,3 +379,106 @@ async def test_reserved_unclaimed_turn_recovery(conversation_case, recovery):
             "AND event_type=$2",
             reserved["correlation_id"], expected_event,
         ) == 1
+
+
+async def enqueue_learning_case(pool, principal, cid, user):
+    job = uuid4()
+    async with pool.acquire() as connection:
+        await connection.execute(
+            "INSERT INTO conversation_learning_jobs "
+            "(job_id,tenant_id,conversation_id,source_message_id) "
+            "VALUES ($1,$2,$3,$4)",
+            job, principal.tenant_id, cid, user,
+        )
+    return job
+
+
+@pytest.mark.asyncio
+async def test_learning_worker_claim_contention(conversation_case):
+    import json
+    from app.conversation_learning_worker import process_one
+    pool, principal, cid, user = conversation_case
+    job = await enqueue_learning_case(pool, principal, cid, user)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class Model:
+        calls = 0
+
+        async def complete(self, messages):
+            self.calls += 1
+            started.set()
+            await release.wait()
+            return json.dumps({"memories": [{
+                "category": "personal_fact", "quote": "First",
+            }]})
+
+    model = Model()
+    async with pool.acquire() as first, pool.acquire() as second:
+        assert await first.fetchval("SELECT pg_backend_pid()") != (
+            await second.fetchval("SELECT pg_backend_pid()")
+        )
+        task = asyncio.create_task(process_one(
+            BoundPool(first), principal, model=model,
+        ))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            other = await asyncio.wait_for(
+                process_one(BoundPool(second), principal, model=model),
+                timeout=5,
+            )
+            assert other is None
+            assert model.calls == 1
+            release.set()
+            result = await asyncio.wait_for(task, timeout=5)
+            assert result == {"job_id": str(job), "proposals": 1}
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    async with pool.acquire() as connection:
+        assert await connection.fetchval(
+            "SELECT attempt FROM conversation_learning_jobs WHERE job_id=$1",
+            job,
+        ) == 1
+        assert await connection.fetchval(
+            "SELECT count(*) FROM conversation_memory_proposals WHERE job_id=$1",
+            job,
+        ) == 1
+
+
+@pytest.mark.asyncio
+async def test_learning_worker_skips_locked_job(conversation_case):
+    from app.conversation_learning_worker import process_one
+    pool, principal, cid, user = conversation_case
+    job = await enqueue_learning_case(pool, principal, cid, user)
+
+    class Model:
+        calls = 0
+
+        async def complete(self, messages):
+            self.calls += 1
+            return '{"memories": []}'
+
+    model = Model()
+    async with pool.acquire() as first, pool.acquire() as second:
+        assert await first.fetchval("SELECT pg_backend_pid()") != (
+            await second.fetchval("SELECT pg_backend_pid()")
+        )
+        async with first.transaction():
+            await first.fetchrow(
+                "SELECT job_id FROM conversation_learning_jobs "
+                "WHERE job_id=$1 FOR UPDATE", job,
+            )
+            result = await asyncio.wait_for(
+                process_one(BoundPool(second), principal, model=model),
+                timeout=5,
+            )
+            assert result is None
+            assert model.calls == 0
+        result = await asyncio.wait_for(
+            process_one(BoundPool(second), principal, model=model),
+            timeout=5,
+        )
+        assert result == {"job_id": str(job), "proposals": 0}
+        assert model.calls == 1

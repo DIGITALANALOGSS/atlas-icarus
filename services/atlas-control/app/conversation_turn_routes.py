@@ -3,7 +3,8 @@ from uuid import UUID
 
 from fastapi import Depends, HTTPException
 from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+from app.conversation_memory import memory_system_message
 
 from app.auth import Principal, require_permission
 from app.conversation_adapters import (
@@ -18,6 +19,14 @@ from app.conversation_coordinator import (
 class ConversationTurnCreate(BaseModel):
     model_config = {"extra": "forbid"}
     user_message_id: UUID
+    workspace_project_id: UUID | None = None
+    memory_context: list[str] = Field(default_factory=list, max_length=12)
+
+    @field_validator("memory_context")
+    @classmethod
+    def validate_memory_context(cls, value):
+        memory_system_message(value)
+        return value
 
 
 def configured_conversation_model():
@@ -112,9 +121,16 @@ def register_conversation_turn_routes(app, write_event):
             await expire_conversation_turns(
                 app.state.pool, principal, conversation_id, write_event=write_event,
             )
+            workspace_options = {}
+            if "workspace_project_id" in request.model_fields_set:
+                workspace_options["workspace_project_id"] = (
+                    request.workspace_project_id
+                )
             result = await execute_turn(
                 app.state.pool, principal, conversation_id, request.user_message_id,
                 model=app.state.conversation_model, write_event=write_event,
+                memory_context=request.memory_context,
+                **workspace_options,
             )
             return {
                 "turn": public_turn(result["turn"]),

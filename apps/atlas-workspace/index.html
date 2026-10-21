@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Atlas Workspace</title>
+<style>
+:root{color-scheme:dark;font:19px/1.6 system-ui;background:#10141e;color:#eef2ff}
+*{box-sizing:border-box}
+body{margin:0}
+a{color:#9de0ff}
+.skip{position:absolute;left:-9999px}
+.skip:focus{left:12px;top:12px;background:#10141e;padding:12px;z-index:5}
+header{padding:18px 24px;border-bottom:1px solid #43516b}
+header p{margin:2px 0;color:#c8d2e5}
+.shell{display:grid;grid-template-columns:245px 1fr;min-height:75vh}
+nav{padding:16px;border-right:1px solid #43516b}
+button,input,textarea,select{font:inherit}
+button{background:#23334c;color:#fff;border:1px solid #8092b1;
+border-radius:10px;padding:10px 15px;cursor:pointer;min-height:48px}
+button:hover{background:#354d70}
+button[aria-current="page"]{background:#166276;border-color:#92edff}
+button:disabled{opacity:.6;cursor:not-allowed}
+:focus-visible{outline:4px solid #ffdb78;outline-offset:3px}
+nav button{display:block;width:100%;text-align:left;margin-bottom:9px}
+main{padding:24px;max-width:1150px;width:100%}
+h1{margin:0;font-size:1.65rem}
+h2{margin-top:0}
+h3{font-size:1.1rem}
+.card{padding:20px;background:#192233;border:1px solid #43516b;
+border-radius:14px;margin:18px 0}
+.muted{color:#c8d2e5}
+textarea,input,select{background:#0d1421;color:#fff;border:1px solid #8191ae;
+border-radius:8px;padding:12px;width:100%}
+textarea{min-height:185px;resize:vertical}
+label{display:block;margin:12px 0 6px}
+.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px}
+footer{position:sticky;bottom:0;background:#111b2b;border-top:1px solid #8191ae;
+padding:12px 20px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+#status{flex:1;min-width:200px}
+li{margin-bottom:9px}
+audio{width:100%;margin-top:12px}
+.badge{display:inline-block;padding:3px 10px;border:1px solid #8092b1;
+border-radius:30px;font-size:.85rem}
+@media(max-width:750px){
+.shell{display:block}nav{display:flex;gap:8px;overflow:auto;border-right:0}
+nav button{width:auto;white-space:nowrap;margin:0}
+main{padding:16px}header{padding:16px}
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to workspace</a>
+<header>
+<h1>Atlas · Personal workspace</h1>
+<p>Voice · Projects · Code · Music · Finance</p>
+<span class="badge">Local frontend prototype · Backend not connected</span>
+</header>
+<div class="shell">
+<nav aria-label="Atlas workspaces" id="nav"></nav>
+<main id="main" tabindex="-1">
+<h2 id="title"></h2>
+<p id="description"></p>
+<section class="card" aria-labelledby="capabilities">
+<h3 id="capabilities">Workspace scope</h3>
+<ul id="features"></ul>
+<p class="muted" id="integration"></p>
+</section>
+<section class="card" id="editor">
+<h3 id="workTitle"></h3>
+<p class="muted">Saved in this browser on this origin, not in Atlas's database.
+Not encrypted storage. Do not enter passwords, account numbers, or secrets.</p>
+<label for="notes">Working notes</label>
+<textarea id="notes"></textarea>
+<div class="actions">
+<button id="save">Save workspace</button>
+<button id="read">Read notes aloud</button>
+</div>
+</section>
+<section class="card" id="music" hidden>
+<h3>Capture a music idea</h3>
+<p>Records your microphone locally. Audio is not uploaded or automatically
+saved. Use Save recording before leaving or refreshing this page.</p>
+<div class="actions">
+<button id="record">Start recording</button>
+<button id="stopRecord" disabled>Stop recording</button>
+</div>
+<div id="recordings"></div>
+</section>
+<section class="card">
+<h3>Build sequence</h3>
+<ol>
+<li>This frontend shell and locally saved workspaces.</li>
+<li>Connect the existing conversation API and durable project memory.</li>
+<li>Connect streaming voice, interruption, and task status.</li>
+<li>Connect coding tools and Creative Pocket audio workflows.</li>
+<li>Connect Financial Visor data, research, alerts, and journal storage.</li>
+<li>Deploy authenticated remote access and cross-device continuity.</li>
+</ol>
+</section>
+</main>
+</div>
+<footer aria-label="Voice and status controls">
+<button id="dictate">Dictate notes</button>
+<button id="stopSpeech">Stop speaking</button>
+<label for="size">Text size</label>
+<select id="size" style="width:auto">
+<option value="19">Standard</option>
+<option value="23">Large</option>
+<option value="28">Extra large</option>
+</select>
+<div id="status" role="status" aria-live="polite">Ready. Local prototype.</div>
+</footer>
+<script>
+const spaces = [
+{id:"assistant",title:"Assistant",
+ description:"Your central conversation and task workspace.",
+ features:["Natural voice conversation and interruption",
+ "Personalized context across projects","Authorized actions and progress"],
+ integration:"Not connected: language model, conversation API, or task execution.",
+ work:"Assistant requests and ideas"},
+{id:"projects",title:"Projects",
+ description:"Keep ongoing work, decisions, and next steps together.",
+ features:["Project context and resume summaries","Decisions and unfinished work",
+ "Shared context for coding, music, research, and finance"],
+ integration:"Working here: one local notes workspace. Structured project records and server sync are not connected.",
+ work:"Project plans and decisions"},
+{id:"code",title:"Code",
+ description:"Your development workspace with Atlas alongside you.",
+ features:["Repository navigation and editing","Reviewable changes",
+ "Authorized tests and development tasks"],
+ integration:"Not connected: repository tools, editor integration, tests, or execution.",
+ work:"Development tasks"},
+{id:"creative",title:"Creative Pocket",
+ description:"Capture and develop your music in the same assistant.",
+ features:["Record musical ideas and spoken notes","Lyrics and arrangements",
+ "Versions, playback, and connected production tools"],
+ integration:"Working here: microphone recording and playback where supported. DAW, MIDI, editing, and model integrations are not connected.",
+ work:"Lyrics, song ideas, and production notes"},
+{id:"finance",title:"Financial Visor",
+ description:"Financial research, market awareness, and decision support.",
+ features:["Market and commodity watchlists","Sourced research and data timestamps",
+ "Portfolio views, risk review, alerts, and trading journal"],
+ integration:"No live prices, account connections, recommendations, or order execution. This prototype only saves your notes.",
+ work:"Watchlist and research journal"},
+{id:"research",title:"Research",
+ description:"Evidence and working knowledge linked to your projects.",
+ features:["Connected search and source tracking","Compare findings",
+ "Preserve research alongside the relevant project"],
+ integration:"Not connected: web search, retrieval, or document processing.",
+ work:"Research questions and sources"},
+{id:"memory",title:"Memory",
+ description:"Preferences and project facts you can inspect and correct.",
+ features:["Accessibility preferences","Project facts and decisions",
+ "Explicit correction, deletion, and memory controls"],
+ integration:"These notes are not automatically supplied to any model. Durable assistant memory is not connected.",
+ work:"Preferences Atlas should remember"},
+{id:"remote",title:"Remote Access",
+ description:"Continue with Atlas from authorized devices away from your desk.",
+ features:["Phone and desktop continuity","Device permissions and revocation",
+ "Host availability and explicit remote-tool approvals"],
+ integration:"Not enabled. This server accepts local connections only. Do not expose this prototype to the internet.",
+ work:"Remote access requirements"},
+{id:"activity",title:"Activity",
+ description:"Understand what Atlas did and what needs your attention.",
+ features:["Running and completed tasks","Approvals and cancellations",
+ "Recoverable errors and action history"],
+ integration:"Only local prototype events appear below; no backend audit stream is connected.",
+ work:"Session events"}
+];
+const $ = id => document.getElementById(id);
+let active, timer, recognition, recorder, stream, chunks=[], audioURLs=[];
+const key = id => "atlas-preview-v1:"+id;
+const events=[];
+function announce(text){$("status").textContent=text}
+function log(text){
+ events.push(new Date().toLocaleTimeString()+" — "+text);
+ if(active==="activity") $("notes").value=events.join("\n");
+}
+function persist(){
+ if(active==="activity") return true;
+ try{localStorage.setItem(key(active),$("notes").value);return true}
+ catch(e){announce("Browser storage unavailable. Notes are not saved.");return false}
+}
+function openSpace(id,focus=true){
+ clearTimeout(timer);
+ if(active && !persist()) return;
+ active=id;
+ const s=spaces.find(x=>x.id===id);
+ $("title").textContent=s.title;
+ $("description").textContent=s.description;
+ $("features").replaceChildren();
+ s.features.forEach(text=>{
+ const li=document.createElement("li");li.textContent=text;
+ $("features").append(li);
+ });
+ $("integration").textContent=s.integration;
+ $("workTitle").textContent=s.work;
+ $("notes").readOnly=id==="activity";
+ try{$("notes").value=id==="activity"?events.join("\n"):localStorage.getItem(key(id))||""}
+ catch(e){$("notes").value="";announce("Browser storage is unavailable.")}
+ $("music").hidden=id!=="creative";
+ $("save").disabled=id==="activity";
+ $("dictate").disabled=id==="activity";
+ document.querySelectorAll("nav button").forEach(b=>{
+ if(b.dataset.id===id)b.setAttribute("aria-current","page");
+ else b.removeAttribute("aria-current");
+ });
+ if(focus)$("main").focus();
+ announce(s.title+" opened. "+s.integration);
+}
+spaces.forEach(s=>{
+ const b=document.createElement("button");
+ b.textContent=s.title;b.dataset.id=s.id;
+ b.onclick=()=>openSpace(s.id);$("nav").append(b);
+});
+$("notes").addEventListener("input",()=>{
+ clearTimeout(timer);timer=setTimeout(persist,500);
+});
+$("save").onclick=()=>{
+ if(persist()){announce("Workspace saved in this browser.");log("Saved "+active)}
+};
+$("read").onclick=()=>{
+ if(!("speechSynthesis" in window)){announce("Speech playback unavailable.");return}
+ speechSynthesis.cancel();
+ const utterance=new SpeechSynthesisUtterance($("notes").value||"No notes yet.");
+ utterance.onerror=()=>announce("Speech playback failed.");
+ speechSynthesis.speak(utterance);
+};
+$("stopSpeech").onclick=()=>{
+ if("speechSynthesis" in window)speechSynthesis.cancel();
+ if(recognition)recognition.stop();
+ announce("Speech and dictation stopped. Recording, if active, is separate.");
+};
+$("dictate").onclick=()=>{
+ const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+ if(!SR){announce("Browser dictation unavailable. Your existing device dictation can still be used.");return}
+ if(!confirm("Browser speech recognition may send microphone audio to the browser provider. Continue?"))return;
+ if(recognition)recognition.stop();
+ const destination=active;
+ recognition=new SR();recognition.lang="en-US";recognition.continuous=false;
+ recognition.onresult=e=>{
+ if(active!==destination){announce("Workspace changed; dictation was not inserted.");return}
+ $("notes").value+=($("notes").value?"\n":"")+e.results[0][0].transcript;
+ if(persist())announce("Dictation added and saved locally.");
+ };
+ recognition.onerror=e=>announce("Dictation error: "+e.error);
+ recognition.onend=()=>{$("dictate").disabled=active==="activity"};
+ recognition.onstart=()=>announce("Listening for dictation.");
+ try{recognition.start();$("dictate").disabled=true}
+ catch(e){announce("Could not start dictation.")}
+};
+$("size").onchange=e=>document.documentElement.style.fontSize=e.target.value+"px";
+$("record").onclick=async()=>{
+ $("record").disabled=true;
+ try{
+ if(!navigator.mediaDevices?.getUserMedia||!window.MediaRecorder)
+ throw Error("Microphone recording is unavailable in this browser.");
+ stream=await navigator.mediaDevices.getUserMedia({audio:true});
+ recorder=new MediaRecorder(stream);chunks=[];
+ recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
+ recorder.onstop=()=>{
+ stream.getTracks().forEach(t=>t.stop());
+ const blob=new Blob(chunks,{type:recorder.mimeType});
+ const url=URL.createObjectURL(blob);audioURLs.push(url);
+ const box=document.createElement("div");
+ const audio=document.createElement("audio");audio.controls=true;audio.src=url;
+ const link=document.createElement("a");link.href=url;
+ const type=blob.type;
+ link.download="atlas-idea-"+Date.now()+(type.includes("mp4")?".mp4":type.includes("ogg")?".ogg":".webm");
+ link.textContent="Save recording to device";
+ box.append(audio,link);$("recordings").prepend(box);
+ $("record").disabled=false;$("stopRecord").disabled=true;
+ announce("Recording ready. Save it before leaving this page.");
+ log("Captured a music idea; download required to keep audio.");
+ };
+ recorder.start();$("stopRecord").disabled=false;
+ announce("Microphone recording. Use Stop recording to finish.");
+ }catch(e){
+ if(stream)stream.getTracks().forEach(t=>t.stop());
+ $("record").disabled=false;announce("Recording failed: "+e.message);
+ }
+};
+$("stopRecord").onclick=()=>{
+ if(recorder?.state==="recording"){recorder.stop();$("stopRecord").disabled=true}
+};
+window.addEventListener("beforeunload",e=>{
+ persist();
+ if(audioURLs.length||recorder?.state==="recording"){e.preventDefault();e.returnValue=""}
+});
+log("Frontend opened. All external integrations disconnected.");
+openSpace("assistant",false);
+</script>
+<script src="/atlas-connected.js"></script>
+<script src="/atlas-project-memory.js"></script>
+</body></html>
