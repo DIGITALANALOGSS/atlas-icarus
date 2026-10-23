@@ -29,11 +29,23 @@ class ConversationTurnCreate(BaseModel):
         return value
 
 
+def configured_tool_proposals():
+    value = os.environ.get("ATLAS_CONVERSATION_TOOL_PROPOSALS", "0").strip()
+    if value not in {"0", "1"}:
+        raise RuntimeError("ATLAS_CONVERSATION_TOOL_PROPOSALS must be 0 or 1")
+    return value == "1"
+
 def configured_conversation_model():
+    enabled = configured_tool_proposals()
     provider = os.environ.get("ATLAS_CONVERSATION_MODEL")
     if provider == "echo":
+        if enabled:
+            raise RuntimeError("Tool proposals require llama_cpp")
         return EchoConversationModel()
     if provider == "llama_cpp":
+        if enabled:
+            from app.conversation_tool_calls import ToolCapableConversationModel
+            return ToolCapableConversationModel.from_environment()
         return LlamaCppConversationModel.from_environment()
     raise RuntimeError("Set ATLAS_CONVERSATION_MODEL to echo or llama_cpp")
 
@@ -91,51 +103,28 @@ def register_conversation_turn_routes(app, write_event):
             raise HTTPException(404, "conversation turn not found")
         return dict(row)
 
-    @app.post("/conversations/{conversation_id}/turns")
-    async def create_conversation_turn(
-        conversation_id: UUID,
-        request: ConversationTurnCreate,
-        principal: Principal = Depends(writer),
-    ):
+    @app.post('/conversations/{conversation_id}/turns')
+    async def create_conversation_turn(conversation_id: UUID, request: ConversationTurnCreate, principal: Principal=Depends(writer)):
         try:
+            tool_mode = configured_tool_proposals()
+            if tool_mode and 'jobs:create' not in principal.permissions:
+                raise HTTPException(403, 'permission denied')
+            if tool_mode and (not callable(getattr(app.state.conversation_model, 'complete_with_tools', None))):
+                raise HTTPException(503, 'structured conversation model unavailable')
             async with app.state.pool.acquire() as connection:
-                source = await connection.fetchrow(
-                    """
-                    SELECT message.role
-                    FROM conversation_messages AS message
-                    JOIN conversations AS conversation
-                      ON conversation.tenant_id = message.tenant_id
-                     AND conversation.conversation_id = message.conversation_id
-                    WHERE message.message_id = $1
-                      AND message.conversation_id = $2
-                      AND message.tenant_id = $3
-                      AND conversation.owner_subject_id = $4
-                    """,
-                    request.user_message_id, conversation_id,
-                    principal.tenant_id, principal.subject_id,
-                )
+                source = await connection.fetchrow('\n                    SELECT message.role\n                    FROM conversation_messages AS message\n                    JOIN conversations AS conversation\n                      ON conversation.tenant_id = message.tenant_id\n                     AND conversation.conversation_id = message.conversation_id\n                    WHERE message.message_id = $1\n                      AND message.conversation_id = $2\n                      AND message.tenant_id = $3\n                      AND conversation.owner_subject_id = $4\n                    ', request.user_message_id, conversation_id, principal.tenant_id, principal.subject_id)
             if source is None:
-                raise HTTPException(404, "conversation or user message not found")
-            if source["role"] != "user":
-                raise HTTPException(409, "turn source must be a user message")
-            await expire_conversation_turns(
-                app.state.pool, principal, conversation_id, write_event=write_event,
-            )
+                raise HTTPException(404, 'conversation or user message not found')
+            if source['role'] != 'user':
+                raise HTTPException(409, 'turn source must be a user message')
+            await expire_conversation_turns(app.state.pool, principal, conversation_id, write_event=write_event)
             workspace_options = {}
-            if "workspace_project_id" in request.model_fields_set:
-                workspace_options["workspace_project_id"] = (
-                    request.workspace_project_id
-                )
-            result = await execute_turn(
-                app.state.pool, principal, conversation_id, request.user_message_id,
-                model=app.state.conversation_model, write_event=write_event,
-                memory_context=request.memory_context,
-                **workspace_options,
-            )
-            return {
-                "turn": public_turn(result["turn"]),
-                "message": jsonable_encoder(result["message"]),
-            }
+            if 'workspace_project_id' in request.model_fields_set:
+                workspace_options['workspace_project_id'] = request.workspace_project_id
+            if tool_mode:
+                workspace_options['tool_mode'] = True
+            result = await execute_turn(app.state.pool, principal, conversation_id, request.user_message_id, model=app.state.conversation_model, write_event=write_event, memory_context=request.memory_context, **workspace_options)
+            return {'turn': public_turn(result['turn']), 'message': jsonable_encoder(result['message'])}
         except HTTPException:
             raise
         except Exception as error:
