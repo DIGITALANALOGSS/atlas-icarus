@@ -1343,196 +1343,46 @@ async def write_event(
     return event_id
 
 
-@app.post("/jobs", status_code=status.HTTP_201_CREATED)
-async def create_job(
-    job: JobCreate,
-    principal: Principal = Depends(require_permission("jobs:create")),
-) -> dict:
+async def _create_job_on_connection(connection, job, principal):
+    """Create a job on the caller's active transaction; does not commit."""
+    if 'jobs:create' not in principal.permissions:
+        raise HTTPException(status_code=403, detail='permission denied')
     job_id = uuid4()
     correlation_id = job.correlation_id or uuid4()
     created_at = datetime.now(timezone.utc)
-    job_status = "pending_approval" if job.approval_required else "queued"
+    job_status = 'pending_approval' if job.approval_required else 'queued'
     approval_gate_id = uuid4() if job.approval_required else None
+    if job.evidence_id is not None:
+        evidence = await connection.fetchrow('\n                        SELECT evidence_id, sha256, correlation_id\n                        FROM evidence_records\n                        WHERE evidence_id = $1 AND tenant_id = $2\n                        FOR SHARE\n                        ', job.evidence_id, principal.tenant_id)
+        if evidence is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='evidence record not found')
+        submitted_sha256 = hashlib.sha256(job.request_payload['content'].encode('utf-8')).hexdigest()
+        if submitted_sha256 != evidence['sha256']:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='content does not match evidence digest')
+        if job.correlation_id is not None and job.correlation_id != evidence['correlation_id']:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='correlation does not match evidence')
+        correlation_id = evidence['correlation_id']
+    if approval_gate_id is not None:
+        approval_summary = f'Approve execution of job {job_id} ({job.job_type}).'
+        approval_payload = {'job_id': str(job_id), 'job_type': job.job_type, 'evidence_id': str(job.evidence_id) if job.evidence_id is not None else None, 'request_payload': job.request_payload}
+        await connection.execute('\n                        INSERT INTO approval_gates (\n                          gate_id, requester, action_type, risk_level,\n                          action_payload, summary, status, correlation_id, tenant_id\n                        )\n                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)\n                        ', approval_gate_id, SERVICE_NAME, 'jobs.execute', 'medium', json.dumps(approval_payload), approval_summary, 'pending', correlation_id, principal.tenant_id)
+        await write_event(connection, tenant_id=principal.tenant_id, event_type='governance.approval_gate.created', correlation_id=correlation_id, occurred_at=created_at, payload={'gate_id': str(approval_gate_id), 'requester': SERVICE_NAME, 'action_type': 'jobs.execute', 'risk_level': 'medium', 'status': 'pending', 'job_id': str(job_id)})
+    await connection.execute('\n                    INSERT INTO jobs (\n                      job_id, job_type, request_payload, status,\n                      approval_required, approval_gate_id, correlation_id, tenant_id,\n                      evidence_id\n                    )\n                    VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9)\n                    ', job_id, job.job_type, json.dumps(job.request_payload), job_status, job.approval_required, approval_gate_id, correlation_id, principal.tenant_id, job.evidence_id)
+    await write_event(connection, tenant_id=principal.tenant_id, event_type='jobs.created', correlation_id=correlation_id, occurred_at=created_at, payload={'job_id': str(job_id), 'job_type': job.job_type, 'evidence_id': str(job.evidence_id) if job.evidence_id is not None else None, 'status': job_status, 'approval_required': job.approval_required, 'approval_gate_id': str(approval_gate_id) if approval_gate_id is not None else None})
+    await write_event(connection, tenant_id=principal.tenant_id, event_type='jobs.approval_requested' if job.approval_required else 'jobs.queued', correlation_id=correlation_id, occurred_at=created_at, payload={'job_id': str(job_id), 'status': job_status, 'approval_gate_id': str(approval_gate_id) if approval_gate_id is not None else None})
+    return {'job_id': str(job_id), 'job_type': job.job_type, 'evidence_id': str(job.evidence_id) if job.evidence_id is not None else None, 'request_payload': job.request_payload, 'status': job_status, 'approval_required': job.approval_required, 'approval_gate_id': str(approval_gate_id) if approval_gate_id is not None else None, 'correlation_id': str(correlation_id), 'result_payload': None, 'error_code': None, 'created_at': serialize_datetime(created_at), 'started_at': None, 'completed_at': None}
 
+
+@app.post('/jobs', status_code=status.HTTP_201_CREATED)
+async def create_job(job: JobCreate, principal: Principal=Depends(require_permission('jobs:create'))) -> dict:
     try:
         async with app.state.pool.acquire() as connection:
             async with connection.transaction():
-                if job.evidence_id is not None:
-                    evidence = await connection.fetchrow(
-                        """
-                        SELECT evidence_id, sha256, correlation_id
-                        FROM evidence_records
-                        WHERE evidence_id = $1 AND tenant_id = $2
-                        FOR SHARE
-                        """,
-                        job.evidence_id,
-                        principal.tenant_id,
-                    )
-                    if evidence is None:
-                        raise HTTPException(
-                            status_code=status.HTTP_404_NOT_FOUND,
-                            detail="evidence record not found",
-                        )
-                    submitted_sha256 = hashlib.sha256(
-                        job.request_payload["content"].encode("utf-8")
-                    ).hexdigest()
-                    if submitted_sha256 != evidence["sha256"]:
-                        raise HTTPException(
-                            status_code=status.HTTP_409_CONFLICT,
-                            detail="content does not match evidence digest",
-                        )
-                    if (
-                        job.correlation_id is not None
-                        and job.correlation_id != evidence["correlation_id"]
-                    ):
-                        raise HTTPException(
-                            status_code=status.HTTP_409_CONFLICT,
-                            detail="correlation does not match evidence",
-                        )
-                    correlation_id = evidence["correlation_id"]
-                if approval_gate_id is not None:
-                    approval_summary = (
-                        f"Approve execution of job {job_id} "
-                        f"({job.job_type})."
-                    )
-                    approval_payload = {
-                        "job_id": str(job_id),
-                        "job_type": job.job_type,
-                        "evidence_id": (
-                            str(job.evidence_id)
-                            if job.evidence_id is not None else None
-                        ),
-                        "request_payload": job.request_payload,
-                    }
-
-                    await connection.execute(
-                        """
-                        INSERT INTO approval_gates (
-                          gate_id, requester, action_type, risk_level,
-                          action_payload, summary, status, correlation_id, tenant_id
-                        )
-                        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
-                        """,
-                        approval_gate_id,
-                        SERVICE_NAME,
-                        "jobs.execute",
-                        "medium",
-                        json.dumps(approval_payload),
-                        approval_summary,
-                        "pending",
-                        correlation_id,
-                        principal.tenant_id,
-                    )
-
-                    await write_event(
-                        connection,
-                        tenant_id=principal.tenant_id,
-                        event_type="governance.approval_gate.created",
-                        correlation_id=correlation_id,
-                        occurred_at=created_at,
-                        payload={
-                            "gate_id": str(approval_gate_id),
-                            "requester": SERVICE_NAME,
-                            "action_type": "jobs.execute",
-                            "risk_level": "medium",
-                            "status": "pending",
-                            "job_id": str(job_id),
-                        },
-                    )
-
-                await connection.execute(
-                    """
-                    INSERT INTO jobs (
-                      job_id, job_type, request_payload, status,
-                      approval_required, approval_gate_id, correlation_id, tenant_id,
-                      evidence_id
-                    )
-                    VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9)
-                    """,
-                    job_id,
-                    job.job_type,
-                    json.dumps(job.request_payload),
-                    job_status,
-                    job.approval_required,
-                    approval_gate_id,
-                    correlation_id,
-                    principal.tenant_id,
-                    job.evidence_id,
-                )
-
-                await write_event(
-                    connection,
-                    tenant_id=principal.tenant_id,
-                    event_type="jobs.created",
-                    correlation_id=correlation_id,
-                    occurred_at=created_at,
-                    payload={
-                        "job_id": str(job_id),
-                        "job_type": job.job_type,
-                        "evidence_id": (
-                            str(job.evidence_id)
-                            if job.evidence_id is not None else None
-                        ),
-                        "status": job_status,
-                        "approval_required": job.approval_required,
-                        "approval_gate_id": (
-                            str(approval_gate_id)
-                            if approval_gate_id is not None
-                            else None
-                        ),
-                    },
-                )
-
-                await write_event(
-                    connection,
-                    tenant_id=principal.tenant_id,
-                    event_type=(
-                        "jobs.approval_requested"
-                        if job.approval_required
-                        else "jobs.queued"
-                    ),
-                    correlation_id=correlation_id,
-                    occurred_at=created_at,
-                    payload={
-                        "job_id": str(job_id),
-                        "status": job_status,
-                        "approval_gate_id": (
-                            str(approval_gate_id)
-                            if approval_gate_id is not None
-                            else None
-                        ),
-                    },
-                )
+                return await _create_job_on_connection(connection, job, principal)
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="database write failed",
-        ) from exc
-
-    return {
-        "job_id": str(job_id),
-        "job_type": job.job_type,
-                        "evidence_id": (
-                            str(job.evidence_id)
-                            if job.evidence_id is not None else None
-                        ),
-        "request_payload": job.request_payload,
-        "status": job_status,
-        "approval_required": job.approval_required,
-        "approval_gate_id": (
-            str(approval_gate_id)
-            if approval_gate_id is not None
-            else None
-        ),
-        "correlation_id": str(correlation_id),
-        "result_payload": None,
-        "error_code": None,
-        "created_at": serialize_datetime(created_at),
-        "started_at": None,
-        "completed_at": None,
-    }
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail='database write failed') from exc
 
 
 @app.get("/jobs/{job_id}")

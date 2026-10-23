@@ -163,127 +163,44 @@ async def _finish_turn(
             return dict(row)
 
 
-async def publish_turn(
-    pool, principal, turn_id, *, worker_token, content, write_event,
-):
-    required = {"conversations:read", "conversations:write"}
+async def publish_turn(pool, principal, turn_id, *, worker_token, content, write_event, tool_calls=()):
+    required = {'conversations:read', 'conversations:write'}
     if not required.issubset(principal.permissions):
-        raise ConversationCoordinatorError("permission denied")
+        raise ConversationCoordinatorError('permission denied')
     if worker_token is None:
-        raise ConversationCoordinatorError("worker token required")
-    if not isinstance(content, str) or not content.strip():
-        raise ConversationCoordinatorError("assistant content must not be blank")
-
+        raise ConversationCoordinatorError('worker token required')
+    if tool_calls:
+        if not isinstance(tool_calls, tuple) or len(tool_calls) != 1:
+            raise ConversationCoordinatorError('exactly one tool proposal required')
+        if 'jobs:create' not in principal.permissions:
+            raise ConversationCoordinatorError('permission denied')
+    elif not isinstance(content, str) or not content.strip():
+        raise ConversationCoordinatorError('assistant content must not be blank')
     async with pool.acquire() as connection:
         async with connection.transaction():
             await execution_lock(connection, principal)
-            turn = await connection.fetchrow(
-                """
-                SELECT turn.*
-                FROM conversation_turns AS turn
-                JOIN conversations AS conversation
-                  ON conversation.tenant_id = turn.tenant_id
-                 AND conversation.conversation_id = turn.conversation_id
-                WHERE turn.turn_id = $1 AND turn.tenant_id = $2
-                  AND conversation.owner_subject_id = $3
-                  AND turn.status = 'running'
-                  AND turn.worker_token = $4
-                  AND turn.lease_expires_at > clock_timestamp()
-                FOR UPDATE OF turn
-                """,
-                turn_id, principal.tenant_id, principal.subject_id, worker_token,
-            )
+            turn = await connection.fetchrow("\n                SELECT turn.*\n                FROM conversation_turns AS turn\n                JOIN conversations AS conversation\n                  ON conversation.tenant_id = turn.tenant_id\n                 AND conversation.conversation_id = turn.conversation_id\n                WHERE turn.turn_id = $1 AND turn.tenant_id = $2\n                  AND conversation.owner_subject_id = $3\n                  AND turn.status = 'running'\n                  AND turn.worker_token = $4\n                  AND turn.lease_expires_at > clock_timestamp()\n                FOR UPDATE OF turn\n                ", turn_id, principal.tenant_id, principal.subject_id, worker_token)
             if turn is None:
-                raise ConversationCoordinatorError("turn unavailable")
+                raise ConversationCoordinatorError('turn unavailable')
             await _memory_lifecycle_gate(connection, principal, dict(turn))
-            conversation = await connection.fetchrow(
-                """
-                SELECT conversation_id FROM conversations
-                WHERE conversation_id = $1 AND tenant_id = $2
-                  AND owner_subject_id = $3
-                FOR UPDATE
-                """,
-                turn["conversation_id"], principal.tenant_id, principal.subject_id,
-            )
+            conversation = await connection.fetchrow('\n                SELECT conversation_id FROM conversations\n                WHERE conversation_id = $1 AND tenant_id = $2\n                  AND owner_subject_id = $3\n                FOR UPDATE\n                ', turn['conversation_id'], principal.tenant_id, principal.subject_id)
             if conversation is None:
-                raise ConversationCoordinatorError("turn unavailable")
-            user_role = await connection.fetchval(
-                """
-                SELECT role FROM conversation_messages
-                WHERE message_id = $1 AND tenant_id = $2
-                  AND conversation_id = $3
-                """,
-                turn["user_message_id"], principal.tenant_id,
-                turn["conversation_id"],
-            )
-            if user_role != "user":
-                raise ConversationCoordinatorError("turn source must be a user message")
-
-            message = await connection.fetchrow(
-                """
-                INSERT INTO conversation_messages (
-                    message_id, tenant_id, conversation_id,
-                    sequence_number, role, content
-                )
-                SELECT $1, $2, $3, COALESCE(MAX(sequence_number), 0) + 1,
-                       'assistant', $4
-                FROM conversation_messages
-                WHERE conversation_id = $3 AND tenant_id = $2
-                RETURNING message_id, conversation_id, sequence_number,
-                          role, content, client_message_id, created_at
-                """,
-                uuid4(), principal.tenant_id, turn["conversation_id"], content,
-            )
-            completed = await connection.fetchrow(
-                """
-                UPDATE conversation_turns
-                SET status = 'completed', assistant_message_id = $4,
-                    completed_at = clock_timestamp(),
-                    worker_token = NULL, lease_expires_at = NULL
-                WHERE turn_id = $1 AND tenant_id = $2
-                  AND status = 'running' AND worker_token = $3
-                  AND lease_expires_at > clock_timestamp()
-                RETURNING *
-                """,
-                turn_id, principal.tenant_id, worker_token, message["message_id"],
-            )
+                raise ConversationCoordinatorError('turn unavailable')
+            user_role = await connection.fetchval('\n                SELECT role FROM conversation_messages\n                WHERE message_id = $1 AND tenant_id = $2\n                  AND conversation_id = $3\n                ', turn['user_message_id'], principal.tenant_id, turn['conversation_id'])
+            if user_role != 'user':
+                raise ConversationCoordinatorError('turn source must be a user message')
+            if tool_calls:
+                from app.conversation_tool_jobs import prepare_tool_job
+                proposed_job = await prepare_tool_job(connection, principal, dict(turn), tool_calls[0])
+                content = 'Prepared metadata analysis job ' + proposed_job['job_id'] + '. Approval gate: ' + proposed_job['approval_gate_id'] + '. It is pending approval and has not been executed.'
+            message = await connection.fetchrow("\n                INSERT INTO conversation_messages (\n                    message_id, tenant_id, conversation_id,\n                    sequence_number, role, content\n                )\n                SELECT $1, $2, $3, COALESCE(MAX(sequence_number), 0) + 1,\n                       'assistant', $4\n                FROM conversation_messages\n                WHERE conversation_id = $3 AND tenant_id = $2\n                RETURNING message_id, conversation_id, sequence_number,\n                          role, content, client_message_id, created_at\n                ", uuid4(), principal.tenant_id, turn['conversation_id'], content)
+            completed = await connection.fetchrow("\n                UPDATE conversation_turns\n                SET status = 'completed', assistant_message_id = $4,\n                    completed_at = clock_timestamp(),\n                    worker_token = NULL, lease_expires_at = NULL\n                WHERE turn_id = $1 AND tenant_id = $2\n                  AND status = 'running' AND worker_token = $3\n                  AND lease_expires_at > clock_timestamp()\n                RETURNING *\n                ", turn_id, principal.tenant_id, worker_token, message['message_id'])
             if completed is None:
-                raise ConversationCoordinatorError("turn unavailable")
-            # Queue source learning in the publication transaction.
-            await connection.execute(
-                """
-                INSERT INTO conversation_learning_jobs (
-                    job_id, tenant_id, conversation_id, source_message_id
-                )
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (
-                    tenant_id, conversation_id, source_message_id
-                ) DO NOTHING
-                """,
-                uuid4(), principal.tenant_id,
-                turn["conversation_id"], turn["user_message_id"],
-            )
-            await connection.execute(
-                """
-                UPDATE conversations SET updated_at = clock_timestamp()
-                WHERE conversation_id = $1 AND tenant_id = $2
-                  AND owner_subject_id = $3
-                """,
-                turn["conversation_id"], principal.tenant_id, principal.subject_id,
-            )
-            await write_event(
-                connection,
-                tenant_id=principal.tenant_id,
-                event_type="governance.conversation.turn.completed",
-                correlation_id=turn["correlation_id"],
-                payload={
-                    "turn_id": str(turn_id),
-                    "conversation_id": str(turn["conversation_id"]),
-                    "assistant_message_id": str(message["message_id"]),
-                    "attempt": completed["attempt"],
-                },
-            )
-            return {"turn": dict(completed), "message": dict(message)}
+                raise ConversationCoordinatorError('turn unavailable')
+            await connection.execute('\n                INSERT INTO conversation_learning_jobs (\n                    job_id, tenant_id, conversation_id, source_message_id\n                )\n                VALUES ($1, $2, $3, $4)\n                ON CONFLICT (\n                    tenant_id, conversation_id, source_message_id\n                ) DO NOTHING\n                ', uuid4(), principal.tenant_id, turn['conversation_id'], turn['user_message_id'])
+            await connection.execute('\n                UPDATE conversations SET updated_at = clock_timestamp()\n                WHERE conversation_id = $1 AND tenant_id = $2\n                  AND owner_subject_id = $3\n                ', turn['conversation_id'], principal.tenant_id, principal.subject_id)
+            await write_event(connection, tenant_id=principal.tenant_id, event_type='governance.conversation.turn.completed', correlation_id=turn['correlation_id'], payload={'turn_id': str(turn_id), 'conversation_id': str(turn['conversation_id']), 'assistant_message_id': str(message['message_id']), 'attempt': completed['attempt']})
+            return {'turn': dict(completed), 'message': dict(message)}
 
 
 def context_digest(messages):
@@ -534,80 +451,60 @@ async def _load_turn_context(
             return list(messages), float(remaining)
 
 
-async def execute_turn(
-    pool, principal, conversation_id, user_message_id, *,
-    model, write_event, lease_seconds=90, memory_context=(),
-    workspace_project_id=WORKSPACE_UNSPECIFIED,
-):
+async def execute_turn(pool, principal, conversation_id, user_message_id, *, model, write_event, lease_seconds=90, memory_context=(), workspace_project_id=WORKSPACE_UNSPECIFIED, tool_mode=False):
     import asyncio
     from app.conversation_adapters import ConversationTurn
     from app.conversation_memory import memory_system_message
-
+    if type(tool_mode) is not bool:
+        raise ConversationCoordinatorError('tool mode must be boolean')
+    if tool_mode:
+        if 'jobs:create' not in principal.permissions:
+            raise ConversationCoordinatorError('permission denied')
+        if not callable(getattr(model, 'complete_with_tools', None)):
+            raise ConversationCoordinatorError('structured model required')
     memory_system_message(memory_context)
     selected_memory = list(memory_context)
-
     workspace_options = {}
     if workspace_project_id is not WORKSPACE_UNSPECIFIED:
-        workspace_options["workspace_project_id"] = workspace_project_id
-    reserved = await reserve_turn(
-        pool, principal, conversation_id, user_message_id, write_event=write_event,
-        memory_context=selected_memory, **workspace_options,
-    )
-    if reserved["status"] == "completed":
+        workspace_options['workspace_project_id'] = workspace_project_id
+    reserved = await reserve_turn(pool, principal, conversation_id, user_message_id, write_event=write_event, memory_context=selected_memory, **workspace_options)
+    if reserved['status'] == 'completed':
         async with pool.acquire() as connection:
-            message = await connection.fetchrow(
-                """
-                SELECT message_id, conversation_id, sequence_number,
-                       role, content, client_message_id, created_at
-                FROM conversation_messages
-                WHERE tenant_id = $1 AND conversation_id = $2
-                  AND message_id = $3 AND role = 'assistant'
-                """,
-                principal.tenant_id, conversation_id,
-                reserved["assistant_message_id"],
-            )
+            message = await connection.fetchrow("\n                SELECT message_id, conversation_id, sequence_number,\n                       role, content, client_message_id, created_at\n                FROM conversation_messages\n                WHERE tenant_id = $1 AND conversation_id = $2\n                  AND message_id = $3 AND role = 'assistant'\n                ", principal.tenant_id, conversation_id, reserved['assistant_message_id'])
             if message is None:
-                raise ConversationCoordinatorError("completed result unavailable")
-            return {"turn": reserved, "message": dict(message)}
-    if reserved["status"] in {"failed", "cancelled"}:
-        raise ConversationCoordinatorError("turn is terminal")
+                raise ConversationCoordinatorError('completed result unavailable')
+            return {'turn': reserved, 'message': dict(message)}
+    if reserved['status'] in {'failed', 'cancelled'}:
+        raise ConversationCoordinatorError('turn is terminal')
     try:
         memory_prompt = memory_system_message(stored_memory_context(reserved))
     except (ValueError, TypeError) as exc:
-        raise ConversationCoordinatorError(
-            "turn memory context unavailable or changed"
-        ) from exc
-    claimed = await claim_turn(
-        pool, principal, reserved["turn_id"],
-        write_event=write_event, lease_seconds=lease_seconds,
-    )
-    turn_id = claimed["turn_id"]
-    token = claimed["worker_token"]
+        raise ConversationCoordinatorError('turn memory context unavailable or changed') from exc
+    claimed = await claim_turn(pool, principal, reserved['turn_id'], write_event=write_event, lease_seconds=lease_seconds)
+    turn_id = claimed['turn_id']
+    token = claimed['worker_token']
     try:
-        rows, remaining = await _load_turn_context(
-            pool, principal, turn_id, token,
-            expected_memory_sha256=reserved['memory_context_sha256'],
-        )
-        context = [ConversationTurn(row["role"], row["content"]) for row in rows]
+        (rows, remaining) = await _load_turn_context(pool, principal, turn_id, token, expected_memory_sha256=reserved['memory_context_sha256'])
+        context = [ConversationTurn(row['role'], row['content']) for row in rows]
         if memory_prompt is not None:
-            context.insert(0, ConversationTurn("system", memory_prompt))
-        content = await asyncio.wait_for(model.complete(context), timeout=remaining)
-        return await publish_turn(
-            pool, principal, turn_id, worker_token=token,
-            content=content, write_event=write_event,
-        )
+            context.insert(0, ConversationTurn('system', memory_prompt))
+        tool_calls = ()
+        if tool_mode:
+            from app.conversation_tool_jobs import proposal_tools
+            from app.conversation_tool_calls import StructuredModelReply
+            reply = await asyncio.wait_for(model.complete_with_tools(context, tools=proposal_tools()), timeout=remaining)
+            if not isinstance(reply, StructuredModelReply):
+                raise ConversationCoordinatorError('invalid structured model reply')
+            (content, tool_calls) = (reply.content, reply.tool_calls)
+        else:
+            content = await asyncio.wait_for(model.complete(context), timeout=remaining)
+        return await publish_turn(pool, principal, turn_id, worker_token=token, content=content, write_event=write_event, tool_calls=tool_calls)
     except Exception as error:
-        code = "execution_timeout" if isinstance(error, TimeoutError) else "execution_failed"
+        code = 'execution_timeout' if isinstance(error, TimeoutError) else 'execution_failed'
         try:
-            await fail_turn(
-                pool, principal, turn_id, worker_token=token,
-                error_code=code, write_event=write_event,
-            )
+            await fail_turn(pool, principal, turn_id, worker_token=token, error_code=code, write_event=write_event)
         except Exception as finalization_error:
-            error.add_note(
-                "Failure finalization did not succeed: "
-                + type(finalization_error).__name__
-            )
+            error.add_note('Failure finalization did not succeed: ' + type(finalization_error).__name__)
         raise
 
 
