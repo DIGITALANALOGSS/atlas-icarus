@@ -4,23 +4,8 @@ from app.conversation_coordinator import ConversationCoordinatorError
 from app.conversation_tool_calls import ModelToolCall, _load
 
 def proposal_tools():
-    return [{
-        "type": "function",
-        "function": {
-            "name": "atlas_metadata_analyze",
-            "description": "Prepare text metadata analysis for human approval; do not execute.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "content": {
-                        "type": "string", "minLength": 1, "maxLength": 20000,
-                    },
-                },
-                "required": ["content"],
-                "additionalProperties": False,
-            },
-        },
-    }]
+    from app.conversation_tool_read import job_read_tool
+    return [{'type': 'function', 'function': {'name': 'atlas_metadata_analyze', 'description': 'Prepare text metadata analysis for human approval; do not execute.', 'parameters': {'type': 'object', 'properties': {'content': {'type': 'string', 'minLength': 1, 'maxLength': 20000}}, 'required': ['content'], 'additionalProperties': False}}}, job_read_tool()]
 
 async def prepare_tool_job(connection, principal, turn, call):
     if "jobs:create" not in principal.permissions:

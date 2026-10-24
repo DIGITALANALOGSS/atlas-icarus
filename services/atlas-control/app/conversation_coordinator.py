@@ -190,9 +190,13 @@ async def publish_turn(pool, principal, turn_id, *, worker_token, content, write
             if user_role != 'user':
                 raise ConversationCoordinatorError('turn source must be a user message')
             if tool_calls:
-                from app.conversation_tool_jobs import prepare_tool_job
-                proposed_job = await prepare_tool_job(connection, principal, dict(turn), tool_calls[0])
-                content = 'Prepared metadata analysis job ' + proposed_job['job_id'] + '. Approval gate: ' + proposed_job['approval_gate_id'] + '. It is pending approval and has not been executed.'
+                if getattr(tool_calls[0], 'name', None) == 'atlas_job_status':
+                    from app.conversation_tool_read import read_tool_job
+                    content = await read_tool_job(connection, principal, dict(turn), tool_calls[0])
+                else:
+                    from app.conversation_tool_jobs import prepare_tool_job
+                    proposed_job = await prepare_tool_job(connection, principal, dict(turn), tool_calls[0])
+                    content = 'Prepared metadata analysis job ' + proposed_job['job_id'] + '. Approval gate: ' + proposed_job['approval_gate_id'] + '. It is pending approval and has not been executed.'
             message = await connection.fetchrow("\n                INSERT INTO conversation_messages (\n                    message_id, tenant_id, conversation_id,\n                    sequence_number, role, content\n                )\n                SELECT $1, $2, $3, COALESCE(MAX(sequence_number), 0) + 1,\n                       'assistant', $4\n                FROM conversation_messages\n                WHERE conversation_id = $3 AND tenant_id = $2\n                RETURNING message_id, conversation_id, sequence_number,\n                          role, content, client_message_id, created_at\n                ", uuid4(), principal.tenant_id, turn['conversation_id'], content)
             completed = await connection.fetchrow("\n                UPDATE conversation_turns\n                SET status = 'completed', assistant_message_id = $4,\n                    completed_at = clock_timestamp(),\n                    worker_token = NULL, lease_expires_at = NULL\n                WHERE turn_id = $1 AND tenant_id = $2\n                  AND status = 'running' AND worker_token = $3\n                  AND lease_expires_at > clock_timestamp()\n                RETURNING *\n                ", turn_id, principal.tenant_id, worker_token, message['message_id'])
             if completed is None:
