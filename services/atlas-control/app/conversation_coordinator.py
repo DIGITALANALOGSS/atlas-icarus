@@ -493,7 +493,19 @@ async def execute_turn(pool, principal, conversation_id, user_message_id, *, mod
         if memory_prompt is not None:
             context.insert(0, ConversationTurn('system', memory_prompt))
         tool_calls = ()
-        if tool_mode:
+        research_message = rows[-1]['content'].strip()
+        explicit_research = (
+            research_message == '/search'
+            or research_message.startswith('/search ')
+            or research_message.startswith('/search\n')
+        )
+        if explicit_research:
+            from app.conversation_research import research_answer
+            content = await research_answer(
+                model, research_message[len('/search'):].strip(),
+                remaining=remaining,
+            )
+        elif tool_mode:
             from app.conversation_tool_jobs import proposal_tools
             from app.conversation_tool_calls import StructuredModelReply
             reply = await asyncio.wait_for(model.complete_with_tools(context, tools=proposal_tools()), timeout=remaining)
