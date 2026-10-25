@@ -295,20 +295,32 @@ async def lifespan(app: FastAPI):
     if not database_url:
         raise RuntimeError("DATABASE_URL is not configured")
 
-    app.state.conversation_model = configured_conversation_model()
+    from dataclasses import replace
+    import httpx
+    from app.conversation_adapters import LlamaCppConversationModel
 
-    pool = await asyncpg.create_pool(
-        database_url,
-        min_size=1,
-        max_size=5,
-        command_timeout=5,
-    )
-    try:
-        await apply_migrations(pool)
-        app.state.pool = pool
-        yield
-    finally:
-        await pool.close()
+    model = configured_conversation_model()
+    async with httpx.AsyncClient(
+        timeout=None,
+        follow_redirects=False,
+        trust_env=False,
+    ) as stream_client:
+        if isinstance(model, LlamaCppConversationModel):
+            model = replace(model, stream_client=stream_client)
+        app.state.conversation_model = model
+
+        pool = await asyncpg.create_pool(
+            database_url,
+            min_size=1,
+            max_size=5,
+            command_timeout=5,
+        )
+        try:
+            await apply_migrations(pool)
+            app.state.pool = pool
+            yield
+        finally:
+            await pool.close()
 
 
 app = FastAPI(title=SERVICE_NAME, version=SERVICE_VERSION, lifespan=lifespan)

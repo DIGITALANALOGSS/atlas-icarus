@@ -59,6 +59,9 @@ class LlamaCppConversationModel:
     timeout_seconds: float = 60.0
     max_tokens: int = 512
     temperature: float = 0.2
+    stream_client: object | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.api_key, str) or not self.api_key.strip():

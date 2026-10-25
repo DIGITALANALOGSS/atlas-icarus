@@ -2,6 +2,7 @@
 """atlas-model-streaming-v1: asynchronous OpenAI-compatible SSE."""
 import asyncio
 import json
+from contextlib import asynccontextmanager
 
 
 def decode_event(data):
@@ -37,6 +38,26 @@ def decode_event(data):
     return False, text
 
 
+@asynccontextmanager
+async def streaming_client(model):
+    """Borrow an application client or own a standalone fallback."""
+    import httpx
+
+    client = getattr(model, "stream_client", None)
+    if client is not None:
+        if client.is_closed:
+            raise ValueError("model streaming client is closed")
+        yield client
+        return
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(model.timeout_seconds),
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        yield client
+
+
 async def stream_completion(model, messages):
     """Yield text fragments; closing/cancelling the generator closes HTTP."""
     import httpx
@@ -63,13 +84,11 @@ async def stream_completion(model, messages):
 
     try:
         async with asyncio.timeout(model.timeout_seconds):
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(model.timeout_seconds),
-                follow_redirects=False,
-                trust_env=False,
-            ) as client:
+            async with streaming_client(model) as client:
                 async with client.stream(
-                    "POST", url, json=payload, headers=headers
+                    "POST", url, json=payload, headers=headers,
+                    timeout=httpx.Timeout(model.timeout_seconds),
+                    follow_redirects=False,
                 ) as response:
                     if response.status_code != 200:
                         raise ConversationModelError(
