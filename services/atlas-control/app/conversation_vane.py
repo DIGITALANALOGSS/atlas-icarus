@@ -112,6 +112,94 @@ def _check_cited_source_policy(
         raise SearchError("answer does not cite every required source URL")
 
 
+
+def _new_vane_stream_state():
+    return {
+        "initialized": False, "done": False,
+        "parts": [], "characters": 0, "sources": [],
+    }
+
+
+def _consume_vane_event(line, state):
+    if not line.strip():
+        return None
+    if state["done"]:
+        raise SearchError("Vane sent data after stream completion")
+    try:
+        event = json.loads(line)
+    except (ValueError, UnicodeError, RecursionError):
+        raise SearchError("Vane sent invalid stream JSON") from None
+    if not isinstance(event, dict):
+        raise SearchError("Vane stream event must be an object")
+    kind = event.get("type")
+    if kind == "init":
+        if state["initialized"]:
+            raise SearchError("Vane sent duplicate stream initialization")
+        state["initialized"] = True
+        return ("connected", None)
+    if not state["initialized"]:
+        raise SearchError("Vane stream initialization is missing")
+    if kind == "sources":
+        sources = event.get("data")
+        if not isinstance(sources, list):
+            raise SearchError("Vane stream sources must be a list")
+        state["sources"] = sources
+        return ("sources_received", len(sources))
+    if kind == "response":
+        chunk = event.get("data")
+        if not isinstance(chunk, str):
+            raise SearchError("Vane stream answer chunk must be text")
+        first = state["characters"] == 0 and bool(chunk)
+        state["characters"] += len(chunk)
+        if state["characters"] > 65536:
+            raise SearchError("Vane streamed answer exceeds the limit")
+        if chunk:
+            state["parts"].append(chunk)
+        return ("first_answer_text", None) if first else None
+    if kind == "done":
+        state["done"] = True
+        return ("stream_done", None)
+    raise SearchError("Vane sent an unsupported stream event")
+
+
+
+async def _read_vane_stream(response, started):
+    state = _new_vane_stream_state()
+    pending = bytearray()
+    received = 0
+
+    def consume(line):
+        observation = _consume_vane_event(line, state)
+        if observation:
+            name, count = observation
+            log.info(
+                "Vane event=%s; elapsed_seconds=%.2f; source_count=%s",
+                name, time.monotonic() - started, count,
+            )
+
+    async for chunk in response.aiter_bytes():
+        received += len(chunk)
+        if received > MAX_BYTES:
+            raise SearchError("Vane response exceeds the size limit")
+        pending.extend(chunk)
+        while True:
+            line, separator, rest = pending.partition(b"\n")
+            if not separator:
+                break
+            pending = bytearray(rest)
+            consume(bytes(line))
+
+    if pending.strip():
+        consume(bytes(pending))
+    if not state["done"]:
+        raise SearchError("Vane stream ended without completion")
+
+    return {
+        "message": "".join(state["parts"]),
+        "sources": state["sources"],
+    }
+
+
 def _answer(data, *, allowed_source_hosts=(), required_source_urls=()):
     if not isinstance(data, dict) or "error" in data:
         raise SearchError("Vane returned an invalid research response")
@@ -202,7 +290,11 @@ async def vane_answer(
         raise SearchError("research deadline is invalid or expired")
 
     _validate_source_policy(allowed_source_hosts, required_source_urls)
+    stream_setting = os.environ.get("ATLAS_VANE_STREAMING", "0")
+    if stream_setting not in ("0", "1"):
+        raise SearchError("ATLAS_VANE_STREAMING must be 0 or 1")
     endpoint, payload = _configuration(query.strip())
+    payload["stream"] = stream_setting == "1"
     started = time.monotonic()
 
     async def heartbeat():
@@ -226,6 +318,13 @@ async def vane_answer(
                 if response.status_code != 200:
                     raise SearchError(
                         f"Vane returned HTTP {response.status_code}"
+                    )
+                if payload["stream"]:
+                    data = await _read_vane_stream(response, started)
+                    return _answer(
+                        data,
+                        allowed_source_hosts=allowed_source_hosts,
+                        required_source_urls=required_source_urls,
                     )
                 chunks = bytearray()
                 async for chunk in response.aiter_bytes():
