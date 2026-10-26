@@ -35,6 +35,29 @@ def configured_tool_proposals():
         raise RuntimeError("ATLAS_CONVERSATION_TOOL_PROPOSALS must be 0 or 1")
     return value == "1"
 
+
+def configured_research_lease(text):
+    if os.environ.get("ATLAS_RESEARCH_ENABLED") != "1":
+        return None
+    if not isinstance(text, str):
+        return None
+    if not text.strip().startswith(("/search ", "/search\n")):
+        return None
+    value = os.environ.get("ATLAS_RESEARCH_LEASE_SECONDS")
+    if value is None:
+        return None
+    value = value.strip()
+    if (
+        not value or len(value) > 3
+        or not value.isascii() or not value.isdecimal()
+        or not 1 <= int(value) <= 600
+    ):
+        raise RuntimeError(
+            "ATLAS_RESEARCH_LEASE_SECONDS must be an integer from 1 to 600"
+        )
+    return int(value)
+
+
 def configured_conversation_model():
     enabled = configured_tool_proposals()
     provider = os.environ.get("ATLAS_CONVERSATION_MODEL")
@@ -112,13 +135,16 @@ def register_conversation_turn_routes(app, write_event):
             if tool_mode and (not callable(getattr(app.state.conversation_model, 'complete_with_tools', None))):
                 raise HTTPException(503, 'structured conversation model unavailable')
             async with app.state.pool.acquire() as connection:
-                source = await connection.fetchrow('\n                    SELECT message.role\n                    FROM conversation_messages AS message\n                    JOIN conversations AS conversation\n                      ON conversation.tenant_id = message.tenant_id\n                     AND conversation.conversation_id = message.conversation_id\n                    WHERE message.message_id = $1\n                      AND message.conversation_id = $2\n                      AND message.tenant_id = $3\n                      AND conversation.owner_subject_id = $4\n                    ', request.user_message_id, conversation_id, principal.tenant_id, principal.subject_id)
+                source = await connection.fetchrow('\n                    SELECT message.role, message.content\n                    FROM conversation_messages AS message\n                    JOIN conversations AS conversation\n                      ON conversation.tenant_id = message.tenant_id\n                     AND conversation.conversation_id = message.conversation_id\n                    WHERE message.message_id = $1\n                      AND message.conversation_id = $2\n                      AND message.tenant_id = $3\n                      AND conversation.owner_subject_id = $4\n                    ', request.user_message_id, conversation_id, principal.tenant_id, principal.subject_id)
             if source is None:
                 raise HTTPException(404, 'conversation or user message not found')
             if source['role'] != 'user':
                 raise HTTPException(409, 'turn source must be a user message')
             await expire_conversation_turns(app.state.pool, principal, conversation_id, write_event=write_event)
             workspace_options = {}
+            research_lease = configured_research_lease(source.get("content"))
+            if research_lease is not None:
+                workspace_options["lease_seconds"] = research_lease
             if 'workspace_project_id' in request.model_fields_set:
                 workspace_options['workspace_project_id'] = request.workspace_project_id
             if tool_mode:
