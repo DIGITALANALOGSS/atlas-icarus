@@ -111,6 +111,31 @@ def _answer(data):
     ):
         raise SearchError("Vane citation numbers do not match returned sources")
 
+    source_urls = [
+        source["metadata"]["url"] for source in sources
+    ]
+    markdown_links = re.findall(
+        r"\]\((https?://[^ \t\r\n]+?)\)",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if any(target not in source_urls for target in markdown_links):
+        raise SearchError(
+            "Vane answer contains a link absent from returned sources"
+        )
+
+    linked_citations = re.findall(
+        r"\]\((https?://[^ \t\r\n]+?)\)\s*\[(\d{1,10})\]",
+        message,
+        flags=re.IGNORECASE,
+    )
+    for target, number in linked_citations:
+        index = int(number) - 1
+        if not 0 <= index < len(source_urls) or source_urls[index] != target:
+            raise SearchError(
+                "Vane answer link does not match its citation number"
+            )
+
     return (
         message.strip()
         + "\n\nVane sources "
