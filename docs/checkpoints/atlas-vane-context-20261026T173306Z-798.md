@@ -167,3 +167,47 @@ update its running image.
 - This document does not back up model files, Docker volumes, private
   launch records, or unrelated modified/untracked repository work.
 - Full integration is NOT complete.
+
+## Recovery update: Granite startup passed, 2026-10-26
+
+This update supersedes the earlier observation that Granite was offline.
+
+- Reusable launcher: scripts/atlas-granite-start.py
+- Reads a private candidate JSON; does not embed credential contents.
+- Checks for duplicate Granite processes and occupied port 8081.
+- Uses the saved API-key file, CPU execution, and a single model slot.
+- Startup has progress reporting, a five-minute deadline, and memory guards.
+- Failed/interrupted startup attempts stop only the process launched there.
+- Successful startup detaches the server from the launching terminal.
+- This is not a boot service or automatic restart supervisor.
+
+Observed startup:
+- Available memory before launch: 11465 MiB.
+- Requested context: 8192.
+- Port: 8081, bound to 127.0.0.1.
+- Health check passed after approximately one minute of loading.
+- PID at that observation: 953; never use this as a permanent identifier.
+- No generation or large-input qualification was performed.
+
+Private candidate:
+~/.local/state/atlas-granite-context/20261026T173536Z-948/candidate-8192.json
+
+Private startup record:
+~/.local/state/atlas-granite-context/20261026T173536Z-948/startup-20261026T173715Z-952/running.json
+
+Repeatable launch command, only when Granite is absent:
+
+    python3 -B scripts/atlas-granite-start.py "$HOME/.local/state/atlas-granite-context/20261026T173536Z-948/candidate-8192.json"
+
+The candidate and referenced binary/model/key are local prerequisites;
+this Git commit alone cannot provision a fresh machine.
+
+Next qualification:
+1. Confirm actual runtime context from startup evidence.
+2. Test a measured input exceeding 4096 tokens, with output headroom.
+3. Record acceptance, generation result, runtime, and memory.
+4. Requalify source-backed Vane research and failure/cancellation handling.
+5. Preserve the full larger-context and multimodal requirements.
+
+Credential rotation and Qwen dependency migration remain outstanding.
+Health readiness does not establish context capacity or complete integration.
