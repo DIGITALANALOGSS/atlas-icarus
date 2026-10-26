@@ -8,7 +8,10 @@ from app.conversation_adapters import ConversationTurn, LlamaCppConversationMode
 from app.conversation_search import SearchError, search_web
 
 
-async def research_answer(model, query, *, remaining):
+async def research_answer(
+    model, query, *, remaining,
+    allowed_source_hosts=(), required_source_urls=()
+):
     if os.environ.get("ATLAS_RESEARCH_ENABLED") != "1":
         raise SearchError("research is disabled")
     if not isinstance(query, str) or not query.strip() or len(query) > 500:
@@ -19,9 +22,16 @@ async def research_answer(model, query, *, remaining):
     backend = os.environ.get("ATLAS_RESEARCH_BACKEND", "searxng")
     if backend == "vane":
         from app.conversation_vane import vane_answer
-        return await vane_answer(query.strip(), remaining=remaining)
+        return await vane_answer(
+            query.strip(), remaining=remaining,
+            allowed_source_hosts=allowed_source_hosts,
+            required_source_urls=required_source_urls,
+        )
     if backend != "searxng":
         raise SearchError("unknown research backend")
+
+    if allowed_source_hosts != () or required_source_urls != ():
+        raise SearchError("source constraints require the Vane backend")
 
     endpoint = os.environ.get("ATLAS_SEARCH_BASE_URL", "")
     if not endpoint:

@@ -72,7 +72,47 @@ def _configuration(query):
     }
 
 
-def _answer(data):
+
+def _validate_source_policy(allowed_hosts, required_urls):
+    if (
+        type(allowed_hosts) is not tuple
+        or type(required_urls) is not tuple
+        or len(allowed_hosts) > 32
+        or len(required_urls) > 32
+    ):
+        raise SearchError("source policy requires bounded tuples")
+    for host in allowed_hosts:
+        if (
+            not isinstance(host, str)
+            or len(host) > 253
+            or not all(
+                re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", part)
+                for part in host.split(".")
+            )
+        ):
+            raise SearchError("source policy requires exact lowercase hosts")
+    for url in required_urls:
+        parts = _url(url)
+        if len(url) > 8192 or parts.fragment:
+            raise SearchError("required source URL is invalid")
+        if allowed_hosts and parts.hostname not in allowed_hosts:
+            raise SearchError("required URL is outside the allowed hosts")
+
+
+def _check_cited_source_policy(
+    source_urls, citations, allowed_hosts, required_urls
+):
+    _validate_source_policy(allowed_hosts, required_urls)
+    cited_urls = {source_urls[int(number) - 1] for number in citations}
+    if allowed_hosts and any(
+        _url(url).hostname not in allowed_hosts for url in cited_urls
+    ):
+        raise SearchError("cited source is outside the allowed hosts")
+    if not set(required_urls).issubset(cited_urls):
+        raise SearchError("answer does not cite every required source URL")
+
+
+def _answer(data, *, allowed_source_hosts=(), required_source_urls=()):
     if not isinstance(data, dict) or "error" in data:
         raise SearchError("Vane returned an invalid research response")
     message = data.get("message")
@@ -136,6 +176,10 @@ def _answer(data):
                 "Vane answer link does not match its citation number"
             )
 
+    _check_cited_source_policy(
+        source_urls, citations, allowed_source_hosts, required_source_urls
+    )
+
     return (
         message.strip()
         + "\n\nVane sources "
@@ -144,7 +188,9 @@ def _answer(data):
     )
 
 
-async def vane_answer(query, *, remaining):
+async def vane_answer(
+    query, *, remaining, allowed_source_hosts=(), required_source_urls=()
+):
     if not isinstance(query, str) or not query.strip() or len(query) > 500:
         raise SearchError("query must contain 1 to 500 characters")
     if (
@@ -155,6 +201,7 @@ async def vane_answer(query, *, remaining):
     ):
         raise SearchError("research deadline is invalid or expired")
 
+    _validate_source_policy(allowed_source_hosts, required_source_urls)
     endpoint, payload = _configuration(query.strip())
     started = time.monotonic()
 
@@ -189,7 +236,11 @@ async def vane_answer(query, *, remaining):
             data = json.loads(chunks)
         except (ValueError, UnicodeError, RecursionError):
             raise SearchError("Vane returned invalid JSON") from None
-        return _answer(data)
+        return _answer(
+            data,
+            allowed_source_hosts=allowed_source_hosts,
+            required_source_urls=required_source_urls,
+        )
 
     outcome = "failed"
     ticker = asyncio.create_task(heartbeat())
