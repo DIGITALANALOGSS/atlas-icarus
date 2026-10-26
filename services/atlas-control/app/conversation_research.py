@@ -11,13 +11,21 @@ from app.conversation_search import SearchError, search_web
 async def research_answer(model, query, *, remaining):
     if os.environ.get("ATLAS_RESEARCH_ENABLED") != "1":
         raise SearchError("research is disabled")
-    endpoint = os.environ.get("ATLAS_SEARCH_BASE_URL", "")
-    if not endpoint:
-        raise SearchError("search endpoint is not configured")
     if not isinstance(query, str) or not query.strip() or len(query) > 500:
         raise SearchError("query must contain 1 to 500 characters")
     if remaining <= 0:
         raise SearchError("research deadline expired")
+
+    backend = os.environ.get("ATLAS_RESEARCH_BACKEND", "searxng")
+    if backend == "vane":
+        from app.conversation_vane import vane_answer
+        return await vane_answer(query.strip(), remaining=remaining)
+    if backend != "searxng":
+        raise SearchError("unknown research backend")
+
+    endpoint = os.environ.get("ATLAS_SEARCH_BASE_URL", "")
+    if not endpoint:
+        raise SearchError("search endpoint is not configured")
 
     async def work():
         evidence = await search_web(
